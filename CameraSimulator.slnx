@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/KW.CameraSimulator.Protocol/KW.CameraSimulator.Protocol.csproj" />
+    <Project Path="src/KW.CameraSimulatorTool/KW.CameraSimulatorTool.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/KW.CameraSimulator.Tests/KW.CameraSimulator.Tests.csproj" />
+  </Folder>
+</Solution>

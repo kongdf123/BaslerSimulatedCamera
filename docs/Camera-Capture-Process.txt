@@ -1,0 +1,156 @@
+I now have a complete picture of the camera capture pipeline. Here's a detailed walkthrough of the three core aspects.
+
+Camera Capture Process: End-to-End Overview
+The system uses a layered architecture: UI (XAML panels) → ViewModel (LiveVideoViewModel) → Service orchestration → ICameraSource abstraction → CameraBase driver → Basler SDK.
+
+1. How to Connect the Camera
+The connection flow is handled by CameraSourceProvider (application-side factory) and the Basler driver, orchestrated by CameraVideoDeviceService.
+
+Step 1: Read configured cameras
+CameraVideoDeviceService.GetConfiguredVideoCameraDevicesAsync() reads VideoCamera parameters from the workspace settings, filters valid/enabled cameras with serial numbers, sorts by SortOrder (1–4 → slot indices 0–3), and caps at VideoSlotCapacity (4).
+
+Step 2: Environment guard (Basler pylon)
+TryApplyBaslerEnvironmentGuardBeforePreviewAsync() probes the pylon runtime. If the runtime is unavailable, enumeration fails, or no devices are found, it writes a red-cross error to each configured slot and aborts.
+
+Step 3: Create and open the camera source
+TryCreatePreviewSourceWithRetryAsync() calls ICameraSourceProvider.GetCameraSource(serialNumber, vendor), implemented in CameraSourceProvider.cs:43:
+
+text
+
+
+
+CameraDriverFactory.CreateCameraInstance(serialNumber, preferredDriver)
+    → new BaslerCamera(serial)
+camera.OpenCamera()                          // BaslerCamera.OpenCamera()
+new CameraSourceAdapter(camera)              // wraps driver as ICameraSource
+BaslerCamera.OpenCamera() (BaslerCamera.cs:195) does the real work:
+
+new Basler.Pylon.Camera(_selectedDeviceInfo) — instantiate the SDK device handle
+openingCamera.Open() — open the device
+TryReadDeviceStreamState() (since PreserveDeviceParametersOnOpen = true) — read back current stream parameters (resolution, framerate)
+For GigE transport: BaslerGigETransportConfigurator.TryConfigureForConcurrentStreams() to allocate bandwidth
+BaslerDeviceEnumerator.NotifyCameraOpened() — update device tracking
+Step 4: Retry logic
+If opening throws a "device busy" error, the service retries up to 5 attempts (CameraDeviceOpenMaxAttempts), with cooldown between attempts. If stored imaging parameters exist in the DB, they're applied to the opened camera via ApplyPersistedSettingsToOpenedCamera().
+
+Step 5: Start collecting (preview stream)
+After all cameras are opened, CameraVideoPreviewCollect.StartPreviewCollectParallelAsync() calls source.StartPreviewAsync() on each, which delegates to BaslerCamera.StartCollect() (BaslerCamera.cs:287):
+
+csharp
+
+
+
+activeCamera.StreamGrabber.ImageGrabbed += OnImageGrabbed;
+activeCamera.Parameters[PLCamera.AcquisitionMode].SetValue(PLCamera.AcquisitionMode.Continuous);
+activeCamera.StreamGrabber.Start(GrabStrategy.OneByOne, GrabLoop.ProvidedByStreamGrabber);
+This subscribes to the SDK's frame-grab event and starts the continuous acquisition loop. A stream-stall watchdog (_streamStallWatchdogTimer) is started to detect if frames stop arriving (3s timeout) and attempt automatic recovery.
+
+2. How to Capture Each Frame
+Frame capture happens in the Basler SDK's grab callback thread, flows through the event system, and is throttled for UI delivery.
+
+Step 1: SDK grab callback
+BaslerCamera.OnImageGrabbed() (BaslerCamera.cs:1276) is invoked by the pylon StreamGrabber for every captured frame:
+
+Get IGrabResult from event args
+BaslerReusableBgrConverter.TryConvertGrabResultToBgr24() — convert the raw Bayer/Mono frame to BGR24 pixel buffer (reusing buffers to avoid per-frame allocation), applying horizontal mirror if _reverseX is set
+Build CameraFrameEventArgs with width, height, Bgr24 format, pixel buffer, and UTC timestamp
+Interlocked.Increment(ref _successfulGrabFrameCount) and record last successful grab time for the watchdog
+Step 2: Distribute frame via event
+RaiseFrameReceived(frameArgs) (CameraBase.cs:284) is called — this:
+
+Updates the capture frame-rate meter (_captureFrameRateMeter.AddFrame())
+Invokes the FrameReceived event handlers
+Invokes the registered frame callback (_frameCallback)
+Step 3: Two paths from the grab callback
+In OnImageGrabbed, if not recording, it just raises FrameReceived and returns. If recording, it additionally:
+
+Creates a BGR Mat from the pixel buffer (BaslerGrabResultConverter.TryCreateBgrMat)
+Updates _latestFrame cache (for snapshot/photograph)
+Raises FrameReceived
+If not paused, clones the Mat and enqueues it to _recordFrameQueue (a BoundedMatRecordQueue with max depth to bound memory)
+Disposes the temporary Mat
+Step 4: UI delivery via presenter
+The ViewModel subscribes in StartCaptureLivePreview() (LiveVideoViewModel.LiveFrame.cs:51). For each slot, TryAttachCapturePreviewSubscriptionForSlot() subscribes to bridge.Camera.FrameReceived. Frames go through CameraPreviewFramePresenter, which:
+
+Uses reusable WriteableBitmap buffers per slot
+Throttles delivery to the UI dispatcher (avoids flooding the WPF render thread)
+Calls ApplyCapturePreviewImageToSlot(slotIndex, ...) to update the slot's image source
+Tracks display frame-rate meters per slot
+A first-frame watchdog (CameraVideoPreviewFirstFrameWatchdog) waits up to 10s + 5s per extra camera for the first frame on each slot; on timeout it marks the slot as signal-error.
+
+3. How to Store the Video File
+Video writing is decoupled from the grab thread via a bounded queue + background writer loop, with a final FFmpeg remux to correct container timestamps.
+
+Step 1: Start recording
+Manual recording (standby preview, per-slot): BuildManualRecordingOutputPath() produces:
+
+text
+
+
+
+%Videos%\kwsprint\{yyyy-MM-dd}\{serial}_{yyyy-MM-dd-HH-mm-ss}.mp4
+Then source.StartRecordingAsync(outputPath).
+
+Test session recording: VideoCaptureSession.StartRecordingAsync() builds filenames as {athleteId}_{serial}-01.mp4 inside options.SessionDirectory, then calls each source's StartRecordingAsync(filePath) sequentially, recording per-camera start offsets (offsetsMs) for sync.
+
+Step 2: Open the VideoWriter
+BaslerCamera.StartRecord(filePath) (BaslerCamera.cs:361):
+
+Directory.CreateDirectory(directory)
+Compute fps from _frameRate (default 30)
+new VideoWriter().Open(filePath, VideoRecordingCodec.ResolveFourCC(filePath), fps, new Size(width, height)) — this is OpenCvSharp's VideoWriter (e.g., H.264/MP4)
+Create BoundedMatRecordQueue (bounded depth; oldest frames dropped on overflow)
+Reset _recordedFrameCount, set IsRecording = true
+Start background task: RecordLoop(recordCancellation.Token)
+Step 3: Background write loop
+RecordLoop() (BaslerCamera.cs:1395) runs on a background thread:
+
+text
+
+
+
+while (!cancelled || queue has frames):
+    if recordQueue.TryDequeue(out Mat frame):
+        if !frame.Empty():
+            writer.Write(frame)
+            Interlocked.Increment(ref _recordedFrameCount)
+        frame.Dispose()
+    else:
+        Thread.Sleep(2)
+This decouples the fast grab thread from the potentially slower disk/encoder write. The grab callback enqueues cloned Mats; the writer loop drains them.
+
+Step 4: Stop recording
+BaslerCamera.StopRecord() (BaslerCamera.cs:435):
+
+Set IsRecording = false, cancel _recordCancellation
+CameraBackgroundTasks.WaitForCompletion(recordTask, 3s) — wait for the loop to drain remaining frames
+recordQueue.ClearAndDisposeAll() — release any leftover Mats
+writer.Release(); writer.Dispose() — flush and close the video file
+Step 5: Remux to fix timestamps (session recording)
+VideoCaptureSession.StopRecordingAsync() (VideoCaptureSession.cs:275) collects RecordedFrameCount from each source, then calls IVideoFileRemuxer.Remux(filePath, frameCount, actualDurationMs).
+
+Why remux? OpenCv's VideoWriter writes at a constant configured framerate (CFR). If the actual camera framerate drops (e.g., exposure, lighting), the container duration gets compressed. The FfmpegVideoFileRemuxer (in KW.Capture.Video.FFmpeg) remuxes without re-encoding (-c copy), rewriting PTS/DTS and avg_frame_rate/time_base so the container duration matches the real elapsed time. Remux failures are caught and the original file is preserved.
+
+Summary Flow Diagram
+text
+
+
+
+[Camera Hardware]
+      │ (GigE/USB)
+      ▼
+Basler.Pylon.Camera (SDK handle)
+      │ StreamGrabber.ImageGrabbed
+      ▼
+BaslerCamera.OnImageGrabbed()
+      │ convert → BGR24 → CameraFrameEventArgs
+      ├─► RaiseFrameReceived ─► FrameReceived event ─► CameraPreviewFramePresenter ─► UI slot (WriteableBitmap)
+      │
+      └─► (if recording) clone Mat ─► BoundedMatRecordQueue ─► RecordLoop (bg thread) ─► VideoWriter.Write()
+                                                                                              │
+                                                                                              ▼
+                                                                                  .mp4 file on disk
+                                                                                              │
+                                                                                              ▼
+                                                                          FfmpegVideoFileRemuxer (fix timestamps)
+Key files: BaslerCamera.cs (driver), CameraBase.cs (frame event), CameraSourceAdapter.cs (abstraction bridge), CameraSourceProvider.cs (factory), VideoCaptureSession.cs (multi-cam orchestration + remux), LiveVideoViewModel.LivePreview.cs / .LiveFrame.cs / .SlotManualRecording.cs (ViewModel orchestration).

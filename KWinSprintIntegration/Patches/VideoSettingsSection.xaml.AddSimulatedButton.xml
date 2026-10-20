@@ -1,0 +1,35 @@
+<!-- === VideoSettingsSection.xaml 补丁（Option B2） === -->
+<!-- 在现有「添加相机」按钮旁边，增加一个「添加模拟相机」按钮。 -->
+<!-- 绑定到 VideoSettingsViewModel.AddSimulatedCameraCommand（由 [RelayCommand] 自动生成）。 -->
+
+<!-- 找到以下按钮（约 243 行）：
+
+        <Button x:Name="AddCameraButton"
+                Margin="8,0,0,0"
+                Padding="12,0,4,0"
+                HorizontalAlignment="Left"
+                Command="{Binding AddCameraCommand}">
+            <StackPanel Orientation="Horizontal">
+                <Path Data="{StaticResource Icon_Add_Style}"
+                      Width="12" Height="12"
+                      Stretch="Uniform" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" />
+                <TextBlock Text="添加相机" Margin="4,0,0,0" VerticalAlignment="Center" />
+            </StackPanel>
+        </Button>
+
+-->
+
+<!-- 在其后追加： -->
+
+<Button x:Name="AddSimulatedCameraButton"
+        Margin="8,0,0,0"
+        Padding="12,0,4,0"
+        HorizontalAlignment="Left"
+        Command="{Binding AddSimulatedCameraCommand}">
+    <StackPanel Orientation="Horizontal">
+        <Path Data="{StaticResource Icon_Add_Style}"
+              Width="12" Height="12"
+              Stretch="Uniform" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" />
+        <TextBlock Text="添加模拟相机" Margin="4,0,0,0" VerticalAlignment="Center" />
+    </StackPanel>
+</Button>

@@ -1,0 +1,93 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.pidb
+*.psess
+*.vsp
+*.vspx
+*.sap
+
+# Visual Studio Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/
+
+# ReSharper / Rider
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+.idea/
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# NuGet
+*.nupkg
+*.snupkg
+*.nuget.props
+*.nuget.targets
+packages/
+nuget.exe
+NuGet.Config
+
+# Windows-specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Test results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# WPF / Windows Forms
+GeneratedCode/
+*.g.cs
+*.g.i.cs
+*.cache
+
+# Publish / publish profiles
+publish/
+app.publish/
+*.pubxml
+*.pubxml.user
+
+# User secrets
+secrets.json
+*.secrets
+
+# Misc
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
