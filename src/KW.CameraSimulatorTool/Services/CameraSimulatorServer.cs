@@ -37,7 +37,7 @@ public class CameraSimulatorServer : IDisposable
     public bool AllowRemoteConnections => _allowRemoteConnections;
     public int ConnectedClients => _sessions.Count;
 
-    public async Task StartAsync(int port, bool allowRemoteConnections = false)
+    public void Start(int port, bool allowRemoteConnections = false)
     {
         if (_listener != null)
             throw new InvalidOperationException("Server is already running.");
@@ -51,9 +51,15 @@ public class CameraSimulatorServer : IDisposable
         _listener.Start();
 
         string bindInfo = allowRemoteConnections ? "0.0.0.0" : "127.0.0.1";
-        Log($"Server started on {bindInfo}:{port}");
+        Log($"TCP server listening on {bindInfo}:{port}");
 
-        await AcceptLoopAsync(_serverCts.Token);
+        _ = AcceptLoopAsync(_serverCts.Token);
+    }
+
+    public Task StartAsync(int port, bool allowRemoteConnections = false)
+    {
+        Start(port, allowRemoteConnections);
+        return Task.CompletedTask;
     }
 
     public async Task StopAsync()

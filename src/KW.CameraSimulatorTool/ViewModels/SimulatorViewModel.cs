@@ -120,12 +120,44 @@ public class SimulatorViewModel : INotifyPropertyChanged
         }
 
         RefreshEmulationStatus();
+        AutoSyncUserToProcessScope();
+        ProbeAndFixPylonRuntime();
+    }
+
+    private void ProbeAndFixPylonRuntime()
+    {
+        try
+        {
+            var result = PylonRuntimeFixer.CheckAndFix();
+            if (result.NeedsFix && result.FixApplied)
+                AppendLog($"PylonRuntime auto-fixed: {result.Message}");
+            else if (result.NeedsFix)
+                AppendLog($"PylonRuntime incomplete: {result.Message} (Enable Emulation to retry)");
+            else
+                AppendLog($"PylonRuntime OK — camera emulation DLLs present.");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"PylonRuntime probe error: {ex.Message}");
+        }
+    }
+
+    private void AutoSyncUserToProcessScope()
+    {
+        string? procValue = Environment.GetEnvironmentVariable(PylonCamEmuVariable, EnvironmentVariableTarget.Process);
+        string? userValue = Environment.GetEnvironmentVariable(PylonCamEmuVariable, EnvironmentVariableTarget.User);
+
+        if (string.IsNullOrEmpty(procValue) && !string.IsNullOrEmpty(userValue))
+        {
+            Environment.SetEnvironmentVariable(PylonCamEmuVariable, userValue, EnvironmentVariableTarget.Process);
+            RefreshEmulationStatus();
+        }
     }
 
     private void RefreshEmulationStatus()
     {
-        string? userValue = Environment.GetEnvironmentVariable(PylonCamEmuVariable, EnvironmentVariableTarget.User);
         string? procValue = Environment.GetEnvironmentVariable(PylonCamEmuVariable, EnvironmentVariableTarget.Process);
+        string? userValue = Environment.GetEnvironmentVariable(PylonCamEmuVariable, EnvironmentVariableTarget.User);
 
         string effective = procValue ?? userValue ?? string.Empty;
 
@@ -133,23 +165,40 @@ public class SimulatorViewModel : INotifyPropertyChanged
         {
             IsEmulationEnabled = true;
             EmulatedCount = count;
-            EmulationStatus = $"Enabled (PYLON_CAMEMU={count})";
 
-            if (userValue != procValue && !string.IsNullOrEmpty(procValue))
-                EmulationStatus += " [process]";
-            else if (!string.IsNullOrEmpty(userValue))
-                EmulationStatus += " [user]";
+            bool hasProc = !string.IsNullOrEmpty(procValue);
+            bool hasUser = !string.IsNullOrEmpty(userValue);
+            EmulationStatus = $"PYLON_CAMEMU={count}";
+            if (hasProc && hasUser)
+                EmulationStatus += " (user + process scope)";
+            else if (hasProc)
+                EmulationStatus += " (process scope only)";
+            else if (hasUser)
+                EmulationStatus += " (user scope only — launch KWinSprint via button to inject into process scope)";
         }
         else
         {
             IsEmulationEnabled = false;
             EmulatedCount = DefaultEmulatedCount;
-            EmulationStatus = "Not configured — KWinSprint will not discover simulated cameras";
+            EmulationStatus = "Not configured — click Enable below to make KWinSprint discover simulated cameras";
         }
     }
 
     public void EnableCameraEmulation()
     {
+        AppendLog("Checking PylonRuntime for camera emulation support...");
+        var fixResult = PylonRuntimeFixer.CheckAndFix(msg => AppendLog($"  {msg}"));
+
+        if (fixResult.NeedsFix && !fixResult.FixApplied)
+        {
+            AppendLog("WARNING: PylonRuntime could not be fixed. Camera emulation may not work.");
+            AppendLog("  Try installing full Basler pylon or manually copy PylonCamEmu_v12_TL.dll.");
+        }
+        else if (fixResult.FixApplied)
+        {
+            AppendLog("PylonRuntime repaired successfully — camera emulation DLLs installed.");
+        }
+
         int count = EmulatedCount > 0 ? EmulatedCount : DefaultEmulatedCount;
         Environment.SetEnvironmentVariable(PylonCamEmuVariable, count.ToString(), EnvironmentVariableTarget.User);
         Environment.SetEnvironmentVariable(PylonCamEmuVariable, count.ToString(), EnvironmentVariableTarget.Process);
@@ -215,10 +264,12 @@ public class SimulatorViewModel : INotifyPropertyChanged
 
         try
         {
-            await _server.StartAsync(Port, _allowRemoteConnections);
+            _server.Start(Port, _allowRemoteConnections);
             IsServerRunning = true;
             ServerStatus = $"Running on port {Port} ({(_allowRemoteConnections ? "all interfaces" : "loopback")})";
-            AppendLog($"Server started on port {Port}, allowRemoteConnections={_allowRemoteConnections}");
+            AppendLog($"TCP server ready — connect clients to 127.0.0.1:{Port}");
+            AppendLog("NOTE: This TCP server is for RemoteSimulatedCamera clients only.");
+            AppendLog("To make KWinSprint discover simulated cameras, use the Enable Emulation + Launch KWinSprint above.");
         }
         catch (Exception ex)
         {
