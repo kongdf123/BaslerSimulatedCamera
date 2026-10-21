@@ -61,3 +61,62 @@ Option B2：专用"添加模拟相机"按钮，不修改 Basler 枚举逻辑
 将 KWinSprintIntegration/ 下的 5 个 .cs 文件复制到 KWinSprint 对应位置
 按 Patches/ 下 3 个补丁文件的指引修改守卫、健康轮询、XAML 按钮
 启动模拟器桌面应用 → 在 KWinSprint 设置页点"添加模拟相机" → 即可采集/录像
+
+完整总结
+根因
+KWinSprint 的相机发现链是硬编码的 Basler Pylon SDK 调用：
+
+text
+
+
+
+VideoSettings.Search → BaslerDeviceEnumerator.TryEnumerateDevices()
+  → Pylon.CameraFinder.EnumerateDevices()
+    → 只返回 Pylon SDK 能看到的真实 Basler 相机
+我们的 TCP 模拟器（127.0.0.1:5270）不在这个链路上，所以无论怎么运行都不可能被发现。
+
+零修改方案 —— Pylon 官方相机仿真
+在追踪 KWinSprint 源码时发现了已内置但未启用的 PYLON_CAMEMU 机制：
+
+位置	说明
+BaslerPylonEnvironment.cs:14	PYLON_CAMEMU=N 环境变量是 Basler 官方仿真开关
+BaslerPylonEnvironment.cs:42-46	已存在值时尊重不覆盖（KWinSprint 调用传 0 但尊重外部值）
+App.xaml.cs:114	启动时调用 TryConfigureCameraEmulation(0)
+BaslerDeviceEnumerator.cs:469	每次枚举前调用 TryConfigureCameraEmulation(0)
+工作原理：Basler Pylon SDK 首次初始化时读取 PYLON_CAMEMU=N，自动创建 N 台虚拟 Basler 相机 —— 它们完全兼容标准 Pylon API，通过 CameraFinder.EnumerateDevices() 正常返回。
+
+修改内容（仅我们的模拟器工具，零 KWinSprint 变更）
+SimulatorViewModel.cs 新增：
+
+读取当前 PYLON_CAMEMU 状态（user + process scope）
+EnableCameraEmulation() — 同时设置 user 环境变量（持久化）+ process 环境变量（当前进程）
+DisableCameraEmulation() — 清除两个 scope
+LaunchKWinSprint() — 启动 KWinSprint 并注入环境变量
+RelayCommand 实现 ICommand
+MainWindow.xaml 新增三个区域：
+
+蓝色顶栏 — PYLON_CAMEMU 状态显示
+浅蓝配置区 — Emulated Cameras 数量输入框 + Enable/Disable 按钮 + KWinSprint 路径 + Launch 按钮
+TCP Server 区 — 原有的 TCP 服务器控制（保留作为备选路径）
+使用流程
+text
+
+
+
+1. 运行 KW.CameraSimulatorTool.exe
+2. 输入虚拟相机数量（默认 4）
+3. 点击 "Enable" — 设置 PYLON_CAMEMU=4（user scope 持久化）
+4. 重启 KWinSprint
+5. VideoSettingsSection → Search → 看到 4 台虚拟相机 ✅
+   → 可以正常 Open / Capture / Record
+或者用 Launch 按钮：
+
+text
+
+
+
+1. 在 KWinSprint.exe 框输入路径
+2. 点击 "Launch KWinSprint" — 自动设置 env + 启动
+3. 进入设置页 Search → 直接看到虚拟相机 ✅
+关于帧内容的说明
+Pylon 官方仿真相机生成内置的测试图案（棋盘格/彩条等）。如果你需要自定义帧内容（如之前的彩色渐变、运动目标等），那部分需要 KWinSprint 代码变更 —— 但发现/枚举/打开的流程现在已经完全打通了。

@@ -1,17 +1,59 @@
 <Window x:Class="KW.CameraSimulatorTool.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Camera Simulator" Height="600" Width="900"
+        Title="Camera Simulator" Height="680" Width="960"
         WindowStartupLocation="CenterScreen">
     <DockPanel>
-        <Border DockPanel.Dock="Top" Background="#2D2D30" Padding="12">
+        <Border DockPanel.Dock="Top" Background="#1976D2" Padding="10">
             <StackPanel Orientation="Horizontal">
-                <TextBlock Text="Port:" VerticalAlignment="Center" Foreground="White" Margin="0,0,8,0"/>
-                <TextBox x:Name="PortBox" Text="{Binding Port}" Width="80" VerticalAlignment="Center" Margin="0,0,16,0"/>
-                <Button x:Name="StartBtn" Content="Start Server" Width="120" Click="StartBtn_Click" Margin="0,0,8,0"/>
-                <Button x:Name="StopBtn" Content="Stop Server" Width="120" Click="StopBtn_Click"/>
-                <TextBlock Text="{Binding ServerStatus}" VerticalAlignment="Center" Foreground="#4EC9B0" Margin="16,0,0,0"/>
+                <TextBlock Text="Basler Camera Emulation (PYLON_CAMEMU)" Foreground="White" FontWeight="Bold" FontSize="13" VerticalAlignment="Center"/>
+                <TextBlock x:Name="EmulationStatusTextBlock"
+                           Text="{Binding EmulationStatus}"
+                           Foreground="#B3E5FC" VerticalAlignment="Center" Margin="16,0,0,0" FontSize="12"/>
             </StackPanel>
+        </Border>
+
+        <Border DockPanel.Dock="Top" Background="#E3F2FD" Padding="10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Emulated Cameras:" VerticalAlignment="Center" Foreground="#1565C0" Margin="0,0,8,0"/>
+                <TextBox Grid.Column="1" Text="{Binding EmulatedCount}" Width="50" VerticalAlignment="Center" Margin="0,0,16,0" IsEnabled="{Binding IsServerStopped}"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Content="Enable" Width="80" Command="{Binding EnableEmulationCommand}" Margin="0,0,6,0" Background="#4CAF50" Foreground="White" FontWeight="Bold"/>
+                    <Button Content="Disable" Width="80" Command="{Binding DisableEmulationCommand}" Background="#F44336" Foreground="White" FontWeight="Bold"/>
+                </StackPanel>
+                <StackPanel Grid.Column="4" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="KWinSprint.exe:" VerticalAlignment="Center" Foreground="#1565C0" Margin="0,0,6,0"/>
+                    <TextBox Text="{Binding KWinSprintPath}" Width="260" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <Button Content="Launch KWinSprint" Width="130" Command="{Binding LaunchKWinSprintCommand}" Background="#FF9800" Foreground="White" FontWeight="Bold"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Border DockPanel.Dock="Top" Background="#2D2D30" Padding="12" BorderBrush="#3E3E42" BorderThickness="0,1,0,0">
+            <DockPanel>
+                <TextBlock DockPanel.Dock="Top" Text="TCP Server (Optional)" Foreground="#AAAAAA" FontSize="11" Margin="0,0,0,6"/>
+                <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Port:" VerticalAlignment="Center" Foreground="White" Margin="0,0,8,0"/>
+                <TextBox Grid.Column="1" Text="{Binding Port}" Width="80" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                <Button Grid.Column="2" Content="Start Server" Width="120" Click="StartBtn_Click" Margin="0,0,8,0"/>
+                <Button Grid.Column="3" Content="Stop Server" Width="120" Click="StopBtn_Click"/>
+                <TextBlock Grid.Column="4" Text="{Binding ServerStatus}" VerticalAlignment="Center" Foreground="#4EC9B0" Margin="16,0,0,0"/>
+                </Grid>
+            </DockPanel>
         </Border>
 
         <Border DockPanel.Dock="Bottom" Background="#1E1E1E" Padding="8" Height="150">
