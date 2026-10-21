@@ -20,20 +20,32 @@ public class SimulatorViewModel : INotifyPropertyChanged
     private string _serverStatus = "Stopped";
     private bool _isServerRunning;
     private int _port = CameraProtocol.DefaultPort;
+    private bool _allowRemoteConnections;
     private string _log = string.Empty;
     private int _emulatedCount;
     private bool _isEmulationEnabled;
     private string _emulationStatus = "Not configured";
     private string _kwinsprintPath = string.Empty;
+    private int _connectedClients;
 
     public ObservableCollection<VirtualCameraState> Cameras { get; } = new();
     public ObservableCollection<string> Logs { get; } = new();
+
+    public IReadOnlyList<string> TestPatterns => KW.CameraSimulator.Protocol.TestPatterns.All;
 
     public int Port
     {
         get => _port;
         set { _port = value; OnPropertyChanged(); }
     }
+
+    public bool AllowRemoteConnections
+    {
+        get => _allowRemoteConnections;
+        set { _allowRemoteConnections = value; OnPropertyChanged(); OnPropertyChanged(nameof(BindAddressDisplay)); }
+    }
+
+    public string BindAddressDisplay => _allowRemoteConnections ? "Binding: 0.0.0.0 (all interfaces)" : "Binding: 127.0.0.1 (loopback only)";
 
     public string ServerStatus
     {
@@ -48,6 +60,12 @@ public class SimulatorViewModel : INotifyPropertyChanged
     }
 
     public bool IsServerStopped => !_isServerRunning;
+
+    public int ConnectedClients
+    {
+        get => _connectedClients;
+        set { _connectedClients = value; OnPropertyChanged(); }
+    }
 
     public int EmulatedCount
     {
@@ -97,6 +115,7 @@ public class SimulatorViewModel : INotifyPropertyChanged
                 Height = info.Height,
                 Fps = info.Fps,
                 Enabled = true,
+                TestPattern = KW.CameraSimulator.Protocol.TestPatterns.ColorBars,
             });
         }
 
@@ -136,7 +155,7 @@ public class SimulatorViewModel : INotifyPropertyChanged
         Environment.SetEnvironmentVariable(PylonCamEmuVariable, count.ToString(), EnvironmentVariableTarget.Process);
         RefreshEmulationStatus();
         AppendLog($"Set {PylonCamEmuVariable}={count} (user + process scope)");
-        AppendLog("NOTE: Restart KWinSprint for changes to take effect.");
+        AppendLog("KWinSprint will discover the emulated Basler cameras on next launch.");
     }
 
     public void DisableCameraEmulation()
@@ -180,16 +199,26 @@ public class SimulatorViewModel : INotifyPropertyChanged
     {
         if (_server != null) return;
 
+        foreach (var cam in Cameras) cam.Validate();
+        bool hasErrors = Cameras.Any(c => c.HasValidationError);
+        if (hasErrors)
+        {
+            AppendLog("Cannot start server: one or more cameras have invalid configuration.");
+            ServerStatus = "Configuration error";
+            return;
+        }
+
         _server = new CameraSimulatorServer(Cameras);
         _server.LogMessage += AppendLog;
         _server.CameraUpdated += OnCameraUpdated;
+        _server.ConnectionCountChanged += OnConnectionCountChanged;
 
         try
         {
-            await _server.StartAsync(Port);
+            await _server.StartAsync(Port, _allowRemoteConnections);
             IsServerRunning = true;
-            ServerStatus = $"Running on port {Port}";
-            AppendLog($"Server started on port {Port}");
+            ServerStatus = $"Running on port {Port} ({(_allowRemoteConnections ? "all interfaces" : "loopback")})";
+            AppendLog($"Server started on port {Port}, allowRemoteConnections={_allowRemoteConnections}");
         }
         catch (Exception ex)
         {
@@ -203,8 +232,10 @@ public class SimulatorViewModel : INotifyPropertyChanged
     {
         if (_server == null) return;
         await _server.StopAsync();
+        _server.ConnectionCountChanged -= OnConnectionCountChanged;
         _server = null;
         IsServerRunning = false;
+        ConnectedClients = 0;
         ServerStatus = "Stopped";
         AppendLog("Server stopped");
     }
@@ -221,6 +252,11 @@ public class SimulatorViewModel : INotifyPropertyChanged
                 existing.ActualFps = cam.ActualFps;
             }
         });
+    }
+
+    private void OnConnectionCountChanged(int count)
+    {
+        Application.Current?.Dispatcher.Invoke(() => ConnectedClients = count);
     }
 
     private void AppendLog(string message)

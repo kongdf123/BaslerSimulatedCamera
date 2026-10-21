@@ -1,0 +1,1088 @@
+Yes. I recommend implementing the enhancements in the existing `BaslerSimulatedCamera` repository incrementally, keeping the current WPF simulator and `KWinSprint` camera integration rather than rewriting them.
+
+I would treat this as a small production-quality engineering project, with one important distinction: the custom TCP simulator and Basler Pylon Camera Emulation are separate camera backends. The changes below primarily improve the custom simulator and its integration with `KWinSprint`; they should not be presented as adding configuration support to the Basler SDK itself.
+
+The implementation below is organized by enhancement, with suggested source files, C# code, and acceptance tests. The code is an implementation blueprint based on the source review, not a claim that a complete patch has already been compiled or tested against your repository.
+
+## 1. Implementation roadmap
+
+## 1
+
+P0 — Protocol reliability and client isolation
+
+Fix TCP framing, cancellation, disconnect handling, frame validation, and multi-client acquisition state.
+
+Deliverable: stable discovery, connection, streaming, and recovery.
+
+## 2
+
+P0 — Camera configuration API
+
+Add capability discovery, configuration read/write, validation, and readback.
+
+Deliverable: change settings in KWinSprint and verify they affect generated frames.
+
+## 3
+
+P1 — Diagnostics and WPF user experience
+
+Show camera state, editable configuration, measured FPS, frame counts, and structured errors.
+
+## 4
+
+P1 — Deterministic testing and packaging
+
+Add automated protocol tests, multi-camera tests, fault injection, and safe environment-variable handling.
+
+## 2. Enhancement A: Introduce a proper camera configuration model
+
+The existing protocol needs a way to discover which settings a camera supports, read current values, and change them. Start by defining a configuration model in the shared protocol project so the simulator and KWinSprint use the same types.
+
+Suggested new file: `src/KW.CameraSimulator.Protocol/CameraConfiguration.cs`
+
+```
+
+namespace KW.CameraSimulator.Protocol;
+
+public enum SimulatedPixelFormat
+{
+    Bgr24
+}
+
+public sealed record CameraConfiguration(
+    int Width,
+    int Height,
+    double TargetFrameRate,
+    SimulatedPixelFormat PixelFormat,
+    string TestPattern);
+
+public sealed record CameraConfigurationCapabilities(
+    int MinWidth,
+    int MaxWidth,
+    int WidthStep,
+    int MinHeight,
+    int MaxHeight,
+    int HeightStep,
+    double MinFrameRate,
+    double MaxFrameRate,
+    IReadOnlyList<string> SupportedTestPatterns,
+    IReadOnlyList<string> SupportedPixelFormats);
+
+public sealed record CameraConfigurationRequest(
+    string CameraId,
+    CameraConfiguration Configuration);
+
+public sealed record CameraConfigurationResponse(
+    bool Success,
+    string? Error,
+    CameraConfiguration? Configuration);
+
+```
+
+These are proposed new contracts, not existing repository types.
+
+The server should own the authoritative configuration. The WPF simulator and KWinSprint UI should not each maintain independent copies that can silently disagree.
+
+### Validate configuration before applying it
+
+Suggested new file: `src/KW.CameraSimulator.Tool/Services/CameraConfigurationValidator.cs` (adjust the namespace and directory to match the actual project).
+
+```
+
+using KW.CameraSimulator.Protocol;
+
+public static class CameraConfigurationValidator
+{
+    private static readonly HashSet<string> Patterns =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "ColorBars",
+            "Gradient",
+            "Checkerboard",
+            "MovingTarget"
+        };
+
+    public static string? Validate(CameraConfiguration config)
+    {
+        if (config.Width is < 64 or > 1920)
+            return "Width must be between 64 and 1920.";
+
+        if (config.Height is < 64 or > 1080)
+            return "Height must be between 64 and 1080.";
+
+        if (config.TargetFrameRate is < 1 or > 240 ||
+            double.IsNaN(config.TargetFrameRate) ||
+            double.IsInfinity(config.TargetFrameRate))
+        {
+            return "Target FPS must be between 1 and 240.";
+        }
+
+        if (!Enum.IsDefined(config.PixelFormat))
+            return "Unsupported pixel format.";
+
+        if (!Patterns.Contains(config.TestPattern))
+            return "Unsupported test pattern.";
+
+        return null;
+    }
+}
+
+```
+
+The bounds above are illustrative simulator limits. Replace them with the capabilities you intend to support. If a setting is not actually implemented in the frame generator, do not advertise it as a functional setting.
+
+Acceptance test: set the resolution to 1280×720, read the configuration back, start acquisition, and verify that emitted frame dimensions and payload length match the applied configuration.
+
+## 3. Enhancement B: Fix TCP framing instead of assuming one read equals one command
+
+This is one of the most important reliability fixes.
+
+TCP is a byte stream. A command such as `START` might arrive in multiple reads, while two commands might arrive together in one read. Therefore, this pattern in the existing server is unsafe:
+
+```
+var bytesRead = await stream.ReadAsync(buffer, cancellationToken);
+// Treat the bytes returned by this read as one complete command.
+```
+
+### Recommended protocol structure
+
+Separate control messages from binary video frames:
+
+KWinSprint camera driver
+
+### Control channel
+
+TCP 5270
+
+`LIST`, `OPEN`, `GET_CONFIG`, `SET_CONFIG`, `START`, `STOP`
+
+Newline-delimited JSON requests and responses
+
+### Frame channel
+
+TCP 5271
+
+`FrameHeader + Payload`
+
+Explicit lengths, timestamps, sequence numbers
+
+Camera simulator
+
+Owns camera configuration and frame generation
+
+This requires a coordinated update to both the server and `RemoteSimulatedCamera.cs`. It is safer than mixing textual responses and binary frames on one socket, where a client can lose synchronization.
+
+### Control-message contracts
+
+Suggested new file: `src/KW.CameraSimulator.Protocol/ControlMessage.cs`
+
+```
+
+namespace KW.CameraSimulator.Protocol;
+
+public sealed record ControlRequest(
+    int ProtocolVersion,
+    string RequestId,
+    string Operation,
+    string? CameraId = null,
+    CameraConfiguration? Configuration = null);
+
+public sealed record ControlResponse(
+    int ProtocolVersion,
+    string RequestId,
+    bool Success,
+    string? ErrorCode = null,
+    string? ErrorMessage = null,
+    object? Data = null);
+
+```
+
+Use `System.Text.Json` to serialize each request as one JSON object followed by `\n`. The server should process exactly one complete line at a time.
+
+```
+
+using System.Text;
+using System.Text.Json;
+
+public static class ControlMessageIO
+{
+    private static readonly JsonSerializerOptions JsonOptions =
+        new(JsonSerializerDefaults.Web);
+
+    public static async Task<T?> ReadAsync<T>(
+        StreamReader reader,
+        CancellationToken cancellationToken)
+    {
+        var line = await reader.ReadLineAsync(cancellationToken);
+
+        if (line is null)
+            return default; // Peer disconnected.
+
+        if (line.Length > 64 * 1024)
+            throw new InvalidDataException("Control message too large.");
+
+        return JsonSerializer.Deserialize<T>(line, JsonOptions)
+            ?? throw new InvalidDataException("Invalid control message.");
+    }
+
+    public static async Task WriteAsync<T>(
+        StreamWriter writer,
+        T message,
+        CancellationToken cancellationToken)
+    {
+        var json = JsonSerializer.Serialize(message, JsonOptions);
+
+        await writer.WriteLineAsync(json.AsMemory(), cancellationToken);
+        await writer.FlushAsync(cancellationToken);
+    }
+}
+
+```
+
+Create the `StreamReader` and `StreamWriter` with UTF-8 encoding and leave the underlying network stream open if the connection handler needs to manage it separately.
+
+For a production implementation, also enforce a maximum line length while reading—not only after `ReadLineAsync`—to prevent an unbounded allocation from a malicious or faulty client.
+
+### Update the remote driver
+
+In `KWinSprintIntegration/RemoteSimulatedCamera.cs`, replace ad hoc control-string reads with a method that matches requests and responses by `RequestId`.
+
+```
+
+private async Task<ControlResponse> SendRequestAsync(
+    ControlRequest request,
+    CancellationToken cancellationToken)
+{
+    await ControlMessageIO.WriteAsync(
+        _controlWriter, request, cancellationToken);
+
+    var response = await ControlMessageIO.ReadAsync<ControlResponse>(
+        _controlReader, cancellationToken);
+
+    if (response is null)
+        throw new IOException("Simulator disconnected.");
+
+    if (response.RequestId != request.RequestId)
+        throw new InvalidDataException(
+            "Control response does not match the request.");
+
+    return response;
+}
+
+```
+
+This is a basic request/response example. If the driver will issue multiple concurrent control requests over one connection, add a single-reader response dispatcher and a pending-request dictionary keyed by `RequestId`, rather than allowing multiple callers to read from the same `StreamReader`.
+
+## 4. Enhancement C: Add `GET_FEATURES`, `GET_CONFIG`, and `SET_CONFIG`
+
+Implement the server-side configuration API before building the configuration UI.
+
+The following interface gives the server one clear entry point for camera settings.
+
+Suggested new file: `ICameraConfigurationService.cs`
+
+```
+
+using KW.CameraSimulator.Protocol;
+
+public interface ICameraConfigurationService
+{
+    CameraConfigurationCapabilities GetCapabilities(string cameraId);
+
+    CameraConfiguration GetConfiguration(string cameraId);
+
+    Task<CameraConfiguration> ApplyAsync(
+        string cameraId,
+        CameraConfiguration configuration,
+        CancellationToken cancellationToken);
+}
+
+```
+
+A basic in-memory implementation can store configurations for the four virtual cameras. Use a per-camera lock so that configuration updates cannot race with acquisition startup.
+
+```
+
+using System.Collections.Concurrent;
+using KW.CameraSimulator.Protocol;
+
+public sealed class InMemoryCameraConfigurationService
+    : ICameraConfigurationService
+{
+    private readonly ConcurrentDictionary<string, CameraState> _cameras;
+
+    public InMemoryCameraConfigurationService(
+        IEnumerable<string> cameraIds)
+    {
+        _cameras = new(
+            cameraIds.Select(id =>
+                new KeyValuePair<string, CameraState>(
+                    id,
+                    new CameraState(new CameraConfiguration(
+                        640, 480, 100,
+                        SimulatedPixelFormat.Bgr24,
+                        "ColorBars")))));
+    }
+
+    public CameraConfigurationCapabilities GetCapabilities(
+        string cameraId)
+    {
+        _ = GetState(cameraId);
+
+        return new(
+            MinWidth: 64,
+            MaxWidth: 1920,
+            WidthStep: 1,
+            MinHeight: 64,
+            MaxHeight: 1080,
+            HeightStep: 1,
+            MinFrameRate: 1,
+            MaxFrameRate: 240,
+            SupportedTestPatterns: new[]
+            {
+                "ColorBars", "Gradient",
+                "Checkerboard", "MovingTarget"
+            },
+            SupportedPixelFormats: new[] { "Bgr24" });
+    }
+
+    public CameraConfiguration GetConfiguration(string cameraId)
+    {
+        var state = GetState(cameraId);
+        lock (state.SyncRoot)
+            return state.Configuration;
+    }
+
+    public Task<CameraConfiguration> ApplyAsync(
+        string cameraId,
+        CameraConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var error = CameraConfigurationValidator.Validate(configuration);
+        if (error is not null)
+            throw new ArgumentException(error, nameof(configuration));
+
+        var state = GetState(cameraId);
+
+        lock (state.SyncRoot)
+        {
+            // Prefer to reject changes while streaming unless
+            // live reconfiguration is explicitly implemented.
+            if (state.IsStreaming)
+                throw new InvalidOperationException(
+                    "Stop acquisition before changing configuration.");
+
+            state.Configuration = configuration;
+        }
+
+        return Task.FromResult(configuration);
+    }
+
+    private CameraState GetState(string cameraId) =>
+        _cameras.TryGetValue(cameraId, out var state)
+            ? state
+            : throw new KeyNotFoundException(
+                $"Unknown camera: {cameraId}");
+
+    private sealed class CameraState(CameraConfiguration configuration)
+    {
+        public object SyncRoot { get; } = new();
+        public CameraConfiguration Configuration { get; set; }
+            = configuration;
+        public bool IsStreaming { get; set; }
+    }
+}
+
+```
+
+This sample demonstrates the ownership and validation pattern. To integrate it, either consolidate the server's existing `VirtualCameraState` with this state model or adapt the service to use that existing type. Do not keep two independent stores of camera state in the final implementation.
+
+### Add the new operations to `CameraSimulatorServer.cs`
+
+The request handler should dispatch by operation and return a structured error rather than silently ignoring failures.
+
+```
+
+private async Task<ControlResponse> HandleRequestAsync(
+    ControlRequest request,
+    CancellationToken cancellationToken)
+{
+    if (request.ProtocolVersion != 1)
+    {
+        return new(1, request.RequestId, false,
+            "UNSUPPORTED_PROTOCOL",
+            "Supported protocol version is 1.");
+    }
+
+    try
+    {
+        object data = request.Operation switch
+        {
+            "GET_FEATURES" when request.CameraId is not null
+                => _configurationService.GetCapabilities(
+                    request.CameraId),
+
+            "GET_CONFIG" when request.CameraId is not null
+                => _configurationService.GetConfiguration(
+                    request.CameraId),
+
+            "SET_CONFIG" when request.CameraId is not null
+                && request.Configuration is not null
+                => await _configurationService.ApplyAsync(
+                    request.CameraId,
+                    request.Configuration,
+                    cancellationToken),
+
+            _ => throw new InvalidOperationException(
+                $"Unsupported or incomplete operation: {request.Operation}")
+        };
+
+        return new(1, request.RequestId, true, Data: data);
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return new(1, request.RequestId, false,
+            "CAMERA_NOT_FOUND", ex.Message);
+    }
+    catch (ArgumentException ex)
+    {
+        return new(1, request.RequestId, false,
+            "INVALID_CONFIGURATION", ex.Message);
+    }
+    catch (InvalidOperationException ex)
+    {
+        return new(1, request.RequestId, false,
+            "INVALID_STATE", ex.Message);
+    }
+}
+
+```
+
+In the actual server, merge this dispatch into the existing connection/session handler and add the `LIST`, `OPEN`, `START`, `STOP`, and `CLOSE` operations to the same protocol version. The code above deliberately shows the configuration branch rather than pretending it is a complete replacement for the existing lifecycle handler.
+
+Critical rule: after `SET_CONFIG`, the frame generator must consume the newly applied configuration. Updating only a configuration object is not enough. For example, the frame-generation loop must use the current width, height, frame rate, pixel format, and test pattern—not constants from the original defaults.
+
+## 5. Enhancement D: Fix multi-client streaming and acquisition lifecycle
+
+The current implementation uses shared camera streaming state. That means one client's `STOP` can stop a camera that another client is using.
+
+First, decide on the intended semantics:
+
+- Multiple clients may discover and configure a camera.
+- A camera has one authoritative configuration.
+- Each streaming client has its own subscription and cancellation token.
+- Disconnecting one client must not cancel another client's subscription.
+- If the generator can serve only one consumer, reject additional `START` requests with `CAMERA_BUSY` rather than silently interrupting the first client.
+
+For the current simulator, independent subscriptions are the better target.
+
+### Implement per-client subscriptions
+
+Suggested new file: `CameraSubscriptionManager.cs`
+
+```
+
+using System.Collections.Concurrent;
+using System.Threading.Channels;
+
+public sealed class CameraSubscriptionManager
+{
+    private readonly ConcurrentDictionary<string, Subscription>
+        _subscriptions = new();
+
+    public string Subscribe(
+        string clientId,
+        string cameraId)
+    {
+        var key = $"{clientId}:{cameraId}";
+
+        var subscription = new Subscription(
+            clientId, cameraId,
+            Channel.CreateBounded<byte[]>(
+                new BoundedChannelOptions(3)
+                {
+                    FullMode = BoundedChannelFullMode.DropOldest,
+                    SingleReader = true,
+                    SingleWriter = false
+                }));
+
+        if (!_subscriptions.TryAdd(key, subscription))
+            throw new InvalidOperationException(
+                "Client is already subscribed to this camera.");
+
+        return key;
+    }
+
+    public bool TryPublish(string cameraId, byte[] frame)
+    {
+        var published = false;
+
+        foreach (var subscription in _subscriptions.Values)
+        {
+            if (subscription.CameraId != cameraId)
+                continue;
+
+            // Frames are immutable after publication. If the producer
+            // reuses frame buffers, clone or use an owned buffer pool.
+            published |= subscription.Frames.Writer.TryWrite(frame);
+        }
+
+        return published;
+    }
+
+    public async Task UnsubscribeAsync(string key)
+    {
+        if (_subscriptions.TryRemove(key, out var subscription))
+            subscription.Frames.Writer.TryComplete();
+
+        await Task.CompletedTask;
+    }
+
+    private sealed record Subscription(
+        string ClientId,
+        string CameraId,
+        Channel<byte[]> Frames);
+}
+
+```
+
+This is an illustrative starting point. In the full implementation, the connection handler should own the subscription key and call `UnsubscribeAsync` in its `finally` block. A bounded channel prevents slow clients from causing unbounded memory growth; `DropOldest` is appropriate for a live-preview simulator, but not necessarily for a recording path where every frame must be preserved.
+
+For recording-oriented tests, expose dropped-frame counts and consider a lossless bounded queue with explicit backpressure or a reported overflow error.
+
+### Ensure cancellation reaches every loop
+
+Use a cancellation token per client session:
+
+```
+using var clientCts =
+    CancellationTokenSource.CreateLinkedTokenSource(
+        serverStoppingToken);
+
+try
+{
+    await HandleClientAsync(tcpClient, clientCts.Token);
+}
+finally
+{
+    clientCts.Cancel();
+    // Remove this client's subscriptions and dispose its connection.
+}
+```
+
+Avoid fire-and-forget streaming tasks that are not tracked. Every acquisition task must be awaited or observed, and every client disconnect must release its resources.
+
+Acceptance tests:
+
+1. Client A starts streaming; client B connects and starts streaming.
+2. Client A stops and disconnects.
+3. Client B continues receiving frames.
+4. The simulator shuts down and all client tasks terminate without hanging.
+
+## 6. Enhancement E: Make frame transport self-describing and validate it safely
+
+The current frame protocol uses a fixed 16-byte header and BGR24 payload. Keep the format initially to minimize migration cost, but define exactly what each field means.
+
+A future version should carry:
+
+- Protocol version and pixel format
+- Width and height
+- Sequence number
+- Capture timestamp
+- Payload length
+
+For example, a version-1 frame header could use a fixed 32-byte layout:
+
+| Byte offset | Size | Field                    |
+| ----------- | ---- | ------------------------ |
+| 0           | 4    | Magic bytes, e.g. `KWFR` |
+| 4           | 2    | Protocol version         |
+| 6           | 2    | Pixel format             |
+| 8           | 4    | Width                    |
+| 12          | 4    | Height                   |
+| 16          | 8    | Frame sequence number    |
+| 24          | 4    | Payload length           |
+| 28          | 4    | Reserved flags           |
+
+Define endianness explicitly—prefer little-endian for a Windows-focused implementation—and update both encoder and decoder together.
+
+### Use exact reads and safe size calculations
+
+```
+
+using System.Buffers.Binary;
+
+public static async Task ReadExactlyAsync(
+    Stream stream,
+    Memory<byte> destination,
+    CancellationToken cancellationToken)
+{
+    while (!destination.IsEmpty)
+    {
+        int read = await stream.ReadAsync(
+            destination, cancellationToken);
+
+        if (read == 0)
+            throw new EndOfStreamException(
+                "Connection closed during frame read.");
+
+        destination = destination[read..];
+    }
+}
+
+public static int ValidateBgr24PayloadLength(
+    int width,
+    int height,
+    int payloadLength)
+{
+    const int MaxWidth = 4096;
+    const int MaxHeight = 2160;
+    const int MaxPayloadBytes = 64 * 1024 * 1024;
+
+    if (width <= 0 || width > MaxWidth)
+        throw new InvalidDataException("Invalid frame width.");
+
+    if (height <= 0 || height > MaxHeight)
+        throw new InvalidDataException("Invalid frame height.");
+
+    long expected = checked((long)width * height * 3L);
+
+    if (expected > MaxPayloadBytes)
+        throw new InvalidDataException("Frame payload exceeds limit.");
+
+    if (payloadLength != expected)
+        throw new InvalidDataException(
+            "Frame payload length does not match dimensions.");
+
+    return checked((int)expected);
+}
+
+```
+
+The maximum dimensions and payload limit are policy choices; adjust them to the intended simulator modes. Use `ReadExactlyAsync` for both the header and payload, and validate the header before allocating a frame buffer.
+
+Migration note: changing the frame header breaks compatibility with the existing 16-byte client. Add a protocol-version negotiation step, or update the server and client together in one release. Do not silently reinterpret old frames using the new layout.
+
+## 7. Enhancement F: Report actual performance, not the configured target FPS
+
+In `RemoteSimulatedCamera.cs`, the driver currently uses a default FPS value. That should be treated as the target FPS, not the actual received rate.
+
+Introduce a simple thread-safe statistics component:
+
+```
+
+using System.Diagnostics;
+using System.Threading;
+
+public sealed class FrameStatistics
+{
+    private long _received;
+    private long _dropped;
+    private long _lastFrameTimestamp;
+
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
+
+    public void OnFrameReceived()
+    {
+        Interlocked.Increment(ref _received);
+        Interlocked.Exchange(
+            ref _lastFrameTimestamp, _clock.ElapsedTicks);
+    }
+
+    public void OnFrameDropped() =>
+        Interlocked.Increment(ref _dropped);
+
+    public long FramesReceived => Interlocked.Read(ref _received);
+    public long FramesDropped => Interlocked.Read(ref _dropped);
+
+    public double GetMeasuredFps(long previousCount,
+                                 long previousTicks)
+    {
+        long nowTicks = _clock.ElapsedTicks;
+        long nowCount = FramesReceived;
+        long elapsedTicks = nowTicks - previousTicks;
+
+        if (elapsedTicks <= 0)
+            return 0;
+
+        return (nowCount - previousCount)
+             * (double)Stopwatch.Frequency / elapsedTicks;
+    }
+
+    public long LastFrameAgeMilliseconds
+    {
+        get
+        {
+            long last = Interlocked.Read(ref _lastFrameTimestamp);
+            if (last == 0)
+                return -1;
+
+            return (long)((_clock.ElapsedTicks - last)
+                * 1000.0 / Stopwatch.Frequency);
+        }
+    }
+}
+
+```
+
+The caller should periodically capture the previous frame count and timestamp to calculate the FPS over a measurement interval. Also count sequence-number gaps when the frame protocol supports them; a slow preview queue and a transport-level packet loss event are not the same thing.
+
+Expose at least these metrics in the simulator:
+
+- Target FPS
+- Measured FPS
+- Total frames generated
+- Frames received by each client
+- Frames dropped
+- Last-frame age
+- Current connection/acquisition state
+
+This will make it much easier to distinguish a camera configuration problem from a transport or rendering performance problem.
+
+## 8. Enhancement G: Build an editable camera configuration panel in WPF
+
+The existing simulator's camera table is effectively read-only. Add editable configuration controls and bind them to a view model, rather than modifying XAML controls directly in event handlers.
+
+Suggested view model properties:
+
+```
+
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+
+public partial class CameraConfigurationViewModel : ObservableObject
+{
+    private readonly ICameraConfigurationClient _client;
+
+    public string CameraId { get; }
+
+    [ObservableProperty]
+    private int width = 640;
+
+    [ObservableProperty]
+    private int height = 480;
+
+    [ObservableProperty]
+    private double targetFrameRate = 100;
+
+    [ObservableProperty]
+    private string selectedTestPattern = "ColorBars";
+
+    [ObservableProperty]
+    private bool isBusy;
+
+    [ObservableProperty]
+    private string statusMessage = "Not connected";
+
+    public IReadOnlyList<string> TestPatterns { get; } =
+        new[] { "ColorBars", "Gradient",
+                "Checkerboard", "MovingTarget" };
+
+    public CameraConfigurationViewModel(
+        string cameraId,
+        ICameraConfigurationClient client)
+    {
+        CameraId = cameraId;
+        _client = client;
+    }
+
+    [RelayCommand]
+    private async Task LoadAsync(CancellationToken cancellationToken)
+    {
+        IsBusy = true;
+        try
+        {
+            var config = await _client.GetConfigurationAsync(
+                CameraId, cancellationToken);
+
+            Width = config.Width;
+            Height = config.Height;
+            TargetFrameRate = config.TargetFrameRate;
+            SelectedTestPattern = config.TestPattern;
+            StatusMessage = "Configuration loaded";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Load failed: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    [RelayCommand]
+    private async Task ApplyAsync(CancellationToken cancellationToken)
+    {
+        IsBusy = true;
+        try
+        {
+            var config = new KW.CameraSimulator.Protocol
+                .CameraConfiguration(
+                    Width, Height, TargetFrameRate,
+                    KW.CameraSimulator.Protocol
+                        .SimulatedPixelFormat.Bgr24,
+                    SelectedTestPattern);
+
+            var applied = await _client.SetConfigurationAsync(
+                CameraId, config, cancellationToken);
+
+            // Use server readback as the authoritative value.
+            Width = applied.Width;
+            Height = applied.Height;
+            TargetFrameRate = applied.TargetFrameRate;
+            SelectedTestPattern = applied.TestPattern;
+
+            StatusMessage = "Configuration applied";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Apply failed: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+}
+
+```
+
+`ICameraConfigurationClient` is a proposed client abstraction around the new protocol operations. Its methods should send `GET_CONFIG` and `SET_CONFIG` requests and deserialize the server responses.
+
+If the project already uses a different MVVM library, use its existing observable-property and command patterns rather than adding CommunityToolkit solely for this sample.
+
+### Example WPF layout
+
+```
+
+<StackPanel Margin="16">
+    <TextBlock Text="{Binding CameraId}"
+               FontSize="20"
+               FontWeight="SemiBold" />
+
+    <TextBlock Text="Resolution" Margin="0,12,0,4" />
+
+    <StackPanel Orientation="Horizontal">
+        <TextBox Width="100"
+                 Text="{Binding Width, UpdateSourceTrigger=LostFocus}" />
+        <TextBlock Text="×" Margin="8,0" VerticalAlignment="Center" />
+        <TextBox Width="100"
+                 Text="{Binding Height, UpdateSourceTrigger=LostFocus}" />
+    </StackPanel>
+
+    <TextBlock Text="Target FPS" Margin="0,12,0,4" />
+    <TextBox Width="100"
+             HorizontalAlignment="Left"
+             Text="{Binding TargetFrameRate,
+                            UpdateSourceTrigger=LostFocus}" />
+
+    <TextBlock Text="Test pattern" Margin="0,12,0,4" />
+    <ComboBox ItemsSource="{Binding TestPatterns}"
+              SelectedItem="{Binding SelectedTestPattern}"
+              Width="220"
+              HorizontalAlignment="Left" />
+
+    <StackPanel Orientation="Horizontal" Margin="0,16,0,0">
+        <Button Content="Load"
+                Command="{Binding LoadCommand}"
+                Margin="0,0,8,0" />
+        <Button Content="Apply"
+                Command="{Binding ApplyCommand}"
+                IsEnabled="{Binding IsBusy,
+                                    Converter={StaticResource InverseBooleanConverter}}" />
+    </StackPanel>
+
+    <TextBlock Text="{Binding StatusMessage}" Margin="0,12,0,0" />
+</StackPanel>
+
+```
+
+`InverseBooleanConverter` is a placeholder for a converter in your WPF resources. You can instead expose a `CanApply` property or use a command that disables itself while busy.
+
+### Configuration UI requirements
+
+- Load current configuration from the server when a camera is selected.
+- Display supported ranges and options from `GET_FEATURES`.
+- Validate values before submitting them.
+- Disable or reject configuration changes during acquisition unless live reconfiguration is supported.
+- Show a meaningful error when a camera is disconnected.
+- After applying settings, read back the configuration and verify the next frames match.
+
+For `KWinSprint`, reuse the same configuration client through the existing camera-driver abstraction. The configuration UI should not need a separate path for each simulated camera.
+
+## 9. Enhancement H: Preserve `PYLON_CAMEMU` instead of overwriting the user's environment
+
+The current implementation changes both user-level and process-level `PYLON_CAMEMU`. Disabling emulation then clears the values, potentially removing a configuration that existed before the simulator was opened.
+
+Prefer changing the environment variable only in the process that launches KWinSprint, if that is sufficient for your workflow.
+
+```
+
+using System.Diagnostics;
+
+public static class KWinSprintLauncher
+{
+    public static Process Start(
+        string executablePath,
+        string? emulatorCount = "4")
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            UseShellExecute = false
+        };
+
+        // Set only for this child process.
+        // Pass null to inherit the parent process's setting.
+        if (emulatorCount is not null)
+        {
+            startInfo.Environment["PYLON_CAMEMU"] =
+                emulatorCount;
+        }
+
+        return Process.Start(startInfo)
+            ?? throw new InvalidOperationException(
+                "Failed to launch KWinSprint.");
+    }
+}
+
+```
+
+If the simulator itself must temporarily change a user-level environment variable, save the prior value and restore it only if the current value is still the one your application set. Better still, avoid modifying the user environment at all.
+
+In the UI, make these two features visibly separate:
+
+- Basler Pylon Emulation: the SDK's `PYLON_CAMEMU` mechanism.
+- KWin Remote Camera Simulator: the custom TCP cameras using `SIM-CAM-01`, `SIM-CAM-02`, and so on.
+
+A camera found through one mechanism should not automatically be reported as discoverable through the other.
+
+## 10. Enhancement I: Make the TCP listener secure by default
+
+The server currently binds to `IPAddress.Any`, which exposes the simulator on all network interfaces. For a local development tool, use loopback by default.
+
+```
+
+using System.Net;
+using System.Net.Sockets;
+
+public static TcpListener CreateListener(
+    int port,
+    bool allowRemoteConnections)
+{
+    IPAddress address = allowRemoteConnections
+        ? IPAddress.Any
+        : IPAddress.Loopback;
+
+    return new TcpListener(address, port);
+}
+
+```
+
+Only enable remote connections deliberately. If remote use is required, add an explicit configuration option and document the security model; for a development simulator, firewall restrictions and loopback binding are usually sufficient.
+
+Also add limits for concurrent clients, message sizes, frame dimensions, and idle connections. Treat malformed protocol messages as connection errors rather than allowing them to crash the whole simulator.
+
+## 11. Enhancement J: Add automated tests for every critical behavior
+
+I would add tests in the repository's existing test project if it already has one, or create a dedicated test project such as `KW.CameraSimulator.Tests`.
+
+### Configuration validation tests
+
+```
+
+using Xunit;
+using KW.CameraSimulator.Protocol;
+
+public sealed class CameraConfigurationTests
+{
+    [Fact]
+    public void AcceptsValidConfiguration()
+    {
+        var config = new CameraConfiguration(
+            1280, 720, 30,
+            SimulatedPixelFormat.Bgr24,
+            "ColorBars");
+
+        Assert.Null(CameraConfigurationValidator.Validate(config));
+    }
+
+    [Fact]
+    public void RejectsInvalidResolution()
+    {
+        var config = new CameraConfiguration(
+            0, 720, 30,
+            SimulatedPixelFormat.Bgr24,
+            "ColorBars");
+
+        Assert.NotNull(CameraConfigurationValidator.Validate(config));
+    }
+
+    [Fact]
+    public void RejectsUnsupportedPattern()
+    {
+        var config = new CameraConfiguration(
+            640, 480, 30,
+            SimulatedPixelFormat.Bgr24,
+            "UnknownPattern");
+
+        Assert.NotNull(CameraConfigurationValidator.Validate(config));
+    }
+}
+
+```
+
+### Protocol and lifecycle test matrix
+
+| Test                                      | Expected behavior                                     |
+| ----------------------------------------- | ----------------------------------------------------- |
+| Fragmented control message                | One complete message is parsed correctly              |
+| Two control messages in one network write | Both are processed independently                      |
+| Unsupported protocol version              | Structured error response                             |
+| Unknown camera ID                         | `CAMERA_NOT_FOUND`                                    |
+| Invalid configuration                     | `INVALID_CONFIGURATION`                               |
+| Change configuration while streaming      | Explicit rejection, unless live changes are supported |
+| Truncated frame header                    | Connection error; no invalid allocation               |
+| Payload length mismatch                   | Frame rejected                                        |
+| Client disconnect during frame read       | Session cleans up without crashing the server         |
+| Two clients stream one camera             | One client's stop does not stop the other             |
+| Four cameras stream concurrently          | No cross-camera configuration or frame mix-up         |
+| Server restart                            | Client detects disconnection and can reconnect        |
+| Slow preview client                       | Bounded memory use and observable dropped frames      |
+
+Also add an integration test that applies a new resolution and verifies the actual frame header and payload. A successful `SET_CONFIG` response alone does not prove the configuration works.
+
+## 12. Recommended implementation order
+
+Milestone 1 — Stable transport
+
+Fix exact reads, define control framing, introduce cancellation, validate frame lengths, and correct multi-client lifecycle handling.
+
+Milestone 2 — End-to-end configuration
+
+Add shared configuration contracts, server-side validation, `GET_FEATURES`, `GET_CONFIG`, `SET_CONFIG`, and working frame-generator settings. Update `RemoteSimulatedCamera.cs` to expose those settings through the existing driver abstraction.
+
+Milestone 3 — Usable desktop experience
+
+Add editable camera cards, live status, preview patterns, measured FPS, frame counts, and clear error reporting.
+
+Milestone 4 — Verification and release
+
+Add protocol and integration tests, four-camera stress tests, fault injection, safe environment handling, and packaging checks.
+
+## 13. How I would apply this to your actual repository
+
+The snippets above illustrate the implementation patterns, but several changes must be coordinated rather than pasted in isolation:
+
+- `CameraProtocol.cs` and `RemoteSimulatedCamera.cs` must agree on framing, protocol versions, and error handling.
+- `CameraSimulatorServer.cs` must use one authoritative camera state and manage subscriptions through connection lifetimes.
+- The configuration service must update the real frame generator.
+- The simulator WPF view model and the KWinSprint camera-configuration UI must use the same supported-feature definitions.
+- Any frame-header change requires a coordinated client/server update or explicit compatibility handling.
+
+My recommendation is to start with Milestones 1 and 2. They resolve the underlying reliability and configuration gaps. Redesigning the UI before the server can reliably apply and report settings would risk creating controls that look functional but do not control the camera.
+
+I have not yet produced a complete repository patch or verified these snippets with a build. The next concrete deliverable should be a coordinated code change across the existing source files, followed by a build and the tests above.

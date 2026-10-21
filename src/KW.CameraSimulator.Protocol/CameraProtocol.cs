@@ -13,6 +13,10 @@ public static class CameraProtocol
     public const string CmdStop = "STOP";
     public const string CmdClose = "CLOSE";
     public const string CmdPing = "PING";
+    public const string CmdGetFeatures = "GET_FEATURES";
+    public const string CmdGetConfig = "GET_CONFIG";
+    public const string CmdSetConfig = "SET_CONFIG";
+    public const string CmdGetStatus = "GET_STATUS";
 
     public const string RespOk = "OK";
     public const string RespError = "ERROR";
@@ -66,9 +70,14 @@ public static class CameraProtocol
         if (width <= 0 || height <= 0 || byteCount <= 0)
             return false;
 
-        int expectedBytes = width * height * 3;
-        if (pixelFormat == PixelFormatBgr24 && byteCount != expectedBytes)
+        try
+        {
+            FrameTransport.ValidateBgr24PayloadLength(width, height, byteCount);
+        }
+        catch
+        {
             return false;
+        }
 
         return true;
     }

@@ -2,16 +2,13 @@ using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Diagnostics;
 using KW.Capture.Camera.Support;
 using KW.Capture.Camera.Support.Basler;
 using OpenCvSharp;
 
 namespace KW.Capture.Camera;
 
-/// <summary>
-/// 远程模拟相机：连接 CameraSimulatorTool 桌面应用，通过 TCP 接收 BGR24 帧，
-/// 用于无真机时的联调 / 测试会话。
-/// </summary>
 public sealed class RemoteSimulatedCamera : CameraBase
 {
     private const string SimulatorHost = "127.0.0.1";
@@ -38,40 +35,38 @@ public sealed class RemoteSimulatedCamera : CameraBase
 
     private VideoWriter? _videoWriter;
     private CameraParameterSettings _parameterSettings = CameraParameterSettings.CreateDefaults();
+    private readonly FrameStatistics _stats = new();
 
-    /// <inheritdoc />
     public override CameraDriver Driver => CameraDriver.RemoteSimulated;
 
-    /// <inheritdoc />
     public override long RecordedFrameCount => Interlocked.Read(ref _recordedFrameCount);
 
-    /// <inheritdoc />
     public override int LiveFrameWidth => _frameWidth;
 
-    /// <inheritdoc />
     public override int LiveFrameHeight => _frameHeight;
 
-    /// <inheritdoc />
     public override bool IsRecordingPaused => _isRecordingPaused;
 
-    /// <inheritdoc />
+    public override double MeasuredFps => _stats.GetInstantFps();
+
+    public long FramesReceived => _stats.FramesReceived;
+
+    public long FramesDropped => _stats.FramesDropped;
+
     public override void PauseRecording()
     {
         if (!IsRecording) return;
         _isRecordingPaused = true;
     }
 
-    /// <inheritdoc />
     public override void ResumeRecording()
     {
         if (!IsRecording) return;
         _isRecordingPaused = false;
     }
 
-    /// <inheritdoc />
     public override bool IsCameraDriverAvailable() => true;
 
-    /// <inheritdoc />
     public override IReadOnlyList<CameraDeviceInfo> GetCameraDeviceList()
     {
         var devices = new List<CameraDeviceInfo>();
@@ -109,7 +104,6 @@ public sealed class RemoteSimulatedCamera : CameraBase
         return devices;
     }
 
-    /// <inheritdoc />
     public override bool InitCamera(string serialNumber)
     {
         if (string.IsNullOrWhiteSpace(serialNumber))
@@ -138,7 +132,6 @@ public sealed class RemoteSimulatedCamera : CameraBase
         return true;
     }
 
-    /// <inheritdoc />
     public override bool OpenCamera()
     {
         if (string.IsNullOrWhiteSpace(SerialNumber))
@@ -172,6 +165,25 @@ public sealed class RemoteSimulatedCamera : CameraBase
             }
 
             _isOpen = true;
+
+            try
+            {
+                SendCommand(_stream, $"GET_CONFIG {SerialNumber}");
+                string cfgResp = ReadLine(_stream, 3000);
+                if (!cfgResp.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase))
+                {
+                    var cfg = JsonSerializer.Deserialize<RemoteConfig>(cfgResp);
+                    if (cfg != null)
+                    {
+                        _frameWidth = cfg.Width;
+                        _frameHeight = cfg.Height;
+                        FPS = (float)cfg.Fps;
+                    }
+                }
+            }
+            catch { }
+
+            _stats.Reset();
             _errorMessage = string.Empty;
             return true;
         }
@@ -182,7 +194,6 @@ public sealed class RemoteSimulatedCamera : CameraBase
         }
     }
 
-    /// <inheritdoc />
     public override void CloseCamera()
     {
         if (IsRecording) StopRecord();
@@ -204,7 +215,6 @@ public sealed class RemoteSimulatedCamera : CameraBase
         _isOpen = false;
     }
 
-    /// <inheritdoc />
     public override bool StartCollect()
     {
         if (!CanStartCollect())
@@ -228,7 +238,7 @@ public sealed class RemoteSimulatedCamera : CameraBase
             _receiveThread.Start(_receiveCts.Token);
 
             IsCollecting = true;
-            FPS = (float)DefaultFrameRate;
+            _stats.Reset();
             _errorMessage = string.Empty;
             return true;
         }
@@ -239,7 +249,6 @@ public sealed class RemoteSimulatedCamera : CameraBase
         }
     }
 
-    /// <inheritdoc />
     public override bool StopCollect()
     {
         if (!IsCollecting) return true;
@@ -260,26 +269,39 @@ public sealed class RemoteSimulatedCamera : CameraBase
     private void ReceiveLoop(object? state)
     {
         var ct = (CancellationToken)state!;
-        byte[] headerBuffer = new byte[16];
+        byte[] headerBuffer = new byte[KW.CameraSimulator.Protocol.CameraProtocol.FrameHeaderSize];
 
         try
         {
             while (!ct.IsCancellationRequested && _stream != null)
             {
-                if (!ReadExact(_stream, headerBuffer, 16)) break;
+                if (!ReadExact(_stream, headerBuffer, headerBuffer.Length)) break;
 
-                int width = BitConverter.ToInt32(headerBuffer, 0);
-                int height = BitConverter.ToInt32(headerBuffer, 4);
-                int pixelFormat = BitConverter.ToInt32(headerBuffer, 8);
-                int byteCount = BitConverter.ToInt32(headerBuffer, 12);
+                if (!KW.CameraSimulator.Protocol.CameraProtocol.TryParseFrameHeader(
+                    headerBuffer, out int width, out int height, out int pixelFormat, out int byteCount))
+                {
+                    _stats.OnFrameDropped();
+                    break;
+                }
 
-                if (width <= 0 || height <= 0 || byteCount <= 0) break;
+                try
+                {
+                    KW.CameraSimulator.Protocol.FrameTransport.ValidateBgr24PayloadLength(
+                        width, height, byteCount);
+                }
+                catch
+                {
+                    _stats.OnFrameDropped();
+                    break;
+                }
 
                 byte[] pixels = new byte[byteCount];
                 if (!ReadExact(_stream, pixels, byteCount)) break;
 
                 _frameWidth = width;
                 _frameHeight = height;
+
+                _stats.OnFrameReceived();
 
                 var frameArgs = new CameraFrameEventArgs(
                     width, height, CameraPixelFormat.Bgr24, pixels, DateTime.UtcNow);
@@ -311,7 +333,6 @@ public sealed class RemoteSimulatedCamera : CameraBase
         return true;
     }
 
-    /// <inheritdoc />
     public override bool StartRecord(string filePath)
     {
         if (!CanStartRecord())
@@ -365,7 +386,6 @@ public sealed class RemoteSimulatedCamera : CameraBase
         }
     }
 
-    /// <inheritdoc />
     public override void StopRecord()
     {
         if (!IsRecording) return;
@@ -411,7 +431,6 @@ public sealed class RemoteSimulatedCamera : CameraBase
         }
     }
 
-    /// <inheritdoc />
     public override void Photograph(string filePath)
     {
         if (string.IsNullOrWhiteSpace(filePath))
@@ -459,38 +478,83 @@ public sealed class RemoteSimulatedCamera : CameraBase
         return buffer;
     }
 
-    /// <inheritdoc />
     public override void SetReverseX(bool reverseX) => _reverseX = reverseX;
 
-    /// <inheritdoc />
     public override bool GetReverseX() => _reverseX;
 
-    /// <inheritdoc />
     public override CameraParameterSettings GetCameraParameterSettings()
     {
         lock (_syncRoot) return _parameterSettings.Clone();
     }
 
-    /// <inheritdoc />
     public override void UpdateCameraParameterSettings(CameraParameterSettings settings)
     {
         if (settings == null) return;
         lock (_syncRoot) _parameterSettings = settings.Clone();
     }
 
-    /// <inheritdoc />
     public override bool TryWriteCameraParameterSettings(out string? errorMessage)
     {
         errorMessage = null;
-        lock (_syncRoot)
+
+        try
         {
-            double fps = Math.Clamp(_parameterSettings.FrameRate, 1, 200);
+            CameraParameterSettings settings;
+            lock (_syncRoot) settings = _parameterSettings.Clone();
+
+            bool sentToServer = false;
+
+            if (_isOpen && _stream != null && !string.IsNullOrWhiteSpace(SerialNumber))
+            {
+                var payload = new
+                {
+                    width = Math.Clamp(settings.Width, 64, 1920),
+                    height = Math.Clamp(settings.Height, 64, 1080),
+                    fps = Math.Clamp(settings.FrameRate, 1, 240),
+                };
+
+                string json = JsonSerializer.Serialize(payload);
+                SendCommand(_stream, $"SET_CONFIG {SerialNumber} {json}");
+                string response = ReadLine(_stream, 3000);
+
+                if (response.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase))
+                {
+                    errorMessage = response;
+                    return false;
+                }
+
+                try
+                {
+                    var applied = JsonSerializer.Deserialize<RemoteConfig>(response);
+                    if (applied != null)
+                    {
+                        _frameWidth = applied.Width;
+                        _frameHeight = applied.Height;
+                        FPS = (float)applied.Fps;
+                    }
+                }
+                catch { }
+
+                sentToServer = true;
+            }
+
+            double fps = Math.Clamp(settings.FrameRate, 1, 200);
             FPS = (float)fps;
+
+            if (!sentToServer)
+            {
+                errorMessage = "相机未打开，参数仅保存在本地，未同步到模拟器。";
+            }
+
+            return sentToServer;
         }
-        return true;
+        catch (Exception ex)
+        {
+            errorMessage = $"写入远程相机参数异常：{ex.Message}";
+            return false;
+        }
     }
 
-    /// <inheritdoc />
     public override CameraParameterReadBackResult TryReadCameraParameterSettings()
     {
         CameraParameterSettings settings = GetCameraParameterSettings();
@@ -498,19 +562,21 @@ public sealed class RemoteSimulatedCamera : CameraBase
         settings.Height = _frameHeight;
         settings.FrameRate = FPS > 0 ? FPS : (float)DefaultFrameRate;
 
+        string[] warnings = _isOpen && _stream != null && !string.IsNullOrWhiteSpace(SerialNumber)
+            ? Array.Empty<string>()
+            : new[] { "相机未打开：参数为本地缓存值。" };
+
         return new CameraParameterReadBackResult
         {
             IsSuccess = true,
             Settings = settings,
-            Warnings = new[] { "远程模拟相机：参数仅保存在内存。" },
+            Warnings = warnings,
             ParameterLimits = CameraParameterLimits.CreateFallback(),
         };
     }
 
-    /// <inheritdoc />
     protected override string GetErrorMsg() => _errorMessage;
 
-    /// <inheritdoc />
     protected override bool CheckIsConnected() => _isOpen && _tcpClient != null && _tcpClient.Connected;
 
     private static void SendCommand(NetworkStream stream, string command)
@@ -545,6 +611,83 @@ public sealed class RemoteSimulatedCamera : CameraBase
         public int Width { get; set; }
         public int Height { get; set; }
         public int Fps { get; set; }
+    }
+
+    private sealed class RemoteConfig
+    {
+        public int Width { get; set; }
+        public int Height { get; set; }
+        public double Fps { get; set; }
+        public int PixelFormat { get; set; }
+        public string TestPattern { get; set; } = string.Empty;
+    }
+
+    private sealed class FrameStatistics
+    {
+        private long _received;
+        private long _dropped;
+        private long _lastFrameTimestamp;
+        private long _prevCount;
+        private long _prevTicks;
+
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+
+        public void OnFrameReceived()
+        {
+            Interlocked.Increment(ref _received);
+            Interlocked.Exchange(ref _lastFrameTimestamp, _clock.ElapsedTicks);
+        }
+
+        public void OnFrameDropped() =>
+            Interlocked.Increment(ref _dropped);
+
+        public long FramesReceived => Interlocked.Read(ref _received);
+        public long FramesDropped => Interlocked.Read(ref _dropped);
+
+        public double GetInstantFps()
+        {
+            long nowTicks = _clock.ElapsedTicks;
+            long nowCount = FramesReceived;
+            long elapsedTicks = nowTicks - _prevTicks;
+
+            if (elapsedTicks <= 0)
+            {
+                _prevCount = nowCount;
+                _prevTicks = nowTicks;
+                return 0;
+            }
+
+            double fps = (nowCount - _prevCount)
+                * (double)Stopwatch.Frequency / elapsedTicks;
+
+            _prevCount = nowCount;
+            _prevTicks = nowTicks;
+
+            return fps;
+        }
+
+        public long LastFrameAgeMilliseconds
+        {
+            get
+            {
+                long last = Interlocked.Read(ref _lastFrameTimestamp);
+                if (last == 0)
+                    return -1;
+
+                return (long)((_clock.ElapsedTicks - last)
+                    * 1000.0 / Stopwatch.Frequency);
+            }
+        }
+
+        public void Reset()
+        {
+            Interlocked.Exchange(ref _received, 0);
+            Interlocked.Exchange(ref _dropped, 0);
+            Interlocked.Exchange(ref _lastFrameTimestamp, 0);
+            _prevCount = 0;
+            _prevTicks = 0;
+            _clock.Restart();
+        }
     }
 
     protected override void DisposeManagedResources()

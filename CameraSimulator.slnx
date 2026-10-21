@@ -6,4 +6,5 @@
   <Folder Name="/tests/">
     <Project Path="tests/KW.CameraSimulator.Tests/KW.CameraSimulator.Tests.csproj" />
   </Folder>
+  <Project Path="PylonDiag/PylonDiag.csproj" />
 </Solution>
