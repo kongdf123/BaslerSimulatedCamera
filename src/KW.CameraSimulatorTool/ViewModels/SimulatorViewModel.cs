@@ -200,19 +200,17 @@ public class SimulatorViewModel : INotifyPropertyChanged
         }
 
         int count = EmulatedCount > 0 ? EmulatedCount : DefaultEmulatedCount;
-        Environment.SetEnvironmentVariable(PylonCamEmuVariable, count.ToString(), EnvironmentVariableTarget.User);
         Environment.SetEnvironmentVariable(PylonCamEmuVariable, count.ToString(), EnvironmentVariableTarget.Process);
         RefreshEmulationStatus();
-        AppendLog($"Set {PylonCamEmuVariable}={count} (user + process scope)");
+        AppendLog($"Set {PylonCamEmuVariable}={count} (process scope only)");
         AppendLog("KWinSprint will discover the emulated Basler cameras on next launch.");
     }
 
     public void DisableCameraEmulation()
     {
-        Environment.SetEnvironmentVariable(PylonCamEmuVariable, null, EnvironmentVariableTarget.User);
         Environment.SetEnvironmentVariable(PylonCamEmuVariable, null, EnvironmentVariableTarget.Process);
         RefreshEmulationStatus();
-        AppendLog($"Cleared {PylonCamEmuVariable} (user + process scope)");
+        AppendLog($"Cleared {PylonCamEmuVariable} (process scope)");
     }
 
     public void LaunchKWinSprint()

@@ -1,0 +1,433 @@
+# Code review: BaslerSimulatedCamera
+
+I reviewed the latest `main` branch of [`kongdf123/BaslerSimulatedCamera`](https://github.com/kongdf123/BaslerSimulatedCamera?utm_source=chatgpt.com), including your new UI commit, the WPF window, the server, the protocol, and the KWinSprint integration.
+
+The latest commit is [`495cbd3`](https://github.com/kongdf123/BaslerSimulatedCamera/commit/495cbd30360c72abd80e69d6d3beda9366d2eb9a?utm_source=chatgpt.com), dated October 22, 2026, with the message `feat(ui): modernize MainWindow layout and styling for improved usability`.
+
+## 1. Overall assessment
+
+UI redesign
+
+Applied
+
+The new XAML is a substantial visual improvement: consistent light theme, reusable styles, clearer sections, and better table readability.
+
+Compatibility with KWinSprint
+
+Not yet verified
+
+The UI commit preserves the existing protocol and camera integration code. That is a good sign, but it does not prove end-to-end compatibility.
+
+Transport reliability
+
+Needs work
+
+The control commands and binary frame data still share a TCP connection. The acquisition stop/restart lifecycle remains the main blocker.
+
+Ready for the next feature milestone?
+
+Not yet
+
+I recommend a reliability and integration milestone before adding more features.
+
+This is a static source review. The latest commit has no reported combined status checks in the GitHub status result I queried, and I have not compiled or executed the current repository. Therefore, I cannot yet confirm that the new XAML builds or that camera acquisition works end to end.
+
+## 2. Findings from the latest code
+
+### P0 — Fix before moving forward
+
+1\. Control commands and frame data share the same TCP stream
+
+Files: `CameraSimulatorServer.cs`, `RemoteSimulatedCamera.cs`
+
+The server writes binary frames and text responses to the same `NetworkStream`. A client can be reading a binary frame header when the server sends the text response to `STOP`. The receiver can interpret the response bytes as frame data.
+
+`StopCollect()` sends `STOP`, cancels its token, and waits up to two seconds for the receiver thread. However, the receiver uses synchronous `NetworkStream.Read()`, which is not cancelled just by cancelling that token. It may remain blocked after the join timeout.
+
+Recommended fix: separate the control and frame transports, or redesign the protocol so responses and frame messages are unambiguously framed and the receiver can shut down deterministically. Separate control and frame ports are the cleaner option.
+
+2\. Runtime configuration is not fully synchronized
+
+Files: `CameraSimulatorServer.cs`, `VirtualCameraState.cs`
+
+The server's `SET_CONFIG` handler rejects changes while a camera is streaming, which is good. However, `StreamFramesAsync()` calculates its frame interval once at the beginning, while camera configuration fields are shared mutable state.
+
+There is also a frame-rate mismatch: the validator accepts fractional FPS, but `VirtualCameraState.Fps` is an integer and `SET_CONFIG` rounds the incoming FPS. For example, a requested 29.5 FPS can become 30 FPS.
+
+Recommended fix: choose integer FPS throughout, or preserve a `double` target frame rate end to end. Snapshot the camera configuration under a lock before streaming and ensure configuration changes cannot race with frame generation.
+
+### P1 — Important fixes before calling the milestone complete
+
+3\. Stopping the server does not fully await client-session shutdown.
+
+In `CameraSimulatorServer.StopAsync()`, the listener is stopped and sessions are disposed, but their running tasks are not explicitly awaited. A session's frame task may still be unwinding while the server resets camera state or is started again.
+
+Recommended: track session and stream tasks, cancel them, close their sockets to unblock reads, and await their completion before reporting the server as stopped.
+
+4\. Pixel-format validation is incomplete.
+
+`CameraProtocol.TryParseFrameHeader()` validates dimensions and the payload length as BGR24, but it does not reject an unsupported `pixelFormat` value. `RemoteSimulatedCamera.ReceiveLoop()` then constructs a BGR24 frame regardless.
+
+Recommended: explicitly require `pixelFormat == PixelFormatBgr24` before accepting a frame.
+
+5\. `PYLON_CAMEMU` still changes the user's persistent environment.
+
+`SimulatorViewModel.EnableCameraEmulation()` sets both the user-level and process-level variables. `DisableCameraEmulation()` clears both. That can overwrite a pre-existing user setting or remove one that another application relies on.
+
+Recommended: make process-scoped configuration the default for launching KWinSprint. If persistent user-level changes remain available, make them an explicit opt-in and preserve the original value.
+
+6\. The current tests do not cover the highest-risk behavior.
+
+The configuration validator tests provide useful boundary and invalid-input coverage. But the key regression risks now concern actual TCP sessions, concurrent reads/writes, stop/restart behavior, and client disconnection.
+
+Recommended: add integration tests for streaming lifecycle and multiple clients before treating the protocol changes as stable.
+
+## 3. UI review: a few changes still worth making
+
+Your redesign is a good improvement, and I would keep it. I found three details worth addressing before calling the UI complete.
+
+| Priority | Issue                                                                   | Recommendation                                                                                                             |
+| -------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| P1       | The entire camera `DataGrid` is disabled while the server runs.         | Keep the table readable and live-updating; disable only editable columns or controls.                                      |
+| P2       | The emulation status badge always uses a blue dot, regardless of state. | Bind its color to an actual status property so enabled, disabled, and error states are distinguishable.                    |
+| P2       | The camera table can become cramped at the minimum window width.        | Test at 960 px and keep horizontal scrolling available; consider moving less frequently used columns into a details panel. |
+
+The first item is a UX concern rather than a protocol defect. Disabling the whole grid prevents accidental edits, but it also makes the live streaming indicators less useful while the simulator is running. The better long-term design is to leave the grid enabled for viewing and disable editing on configuration fields.
+
+One more detail: the new layout displays `ConnectedClients`, which is already present in the view model, so that binding is consistent with the current code.
+
+## 4. Recommended next milestone
+
+I would define the next milestone as Milestone 1.5 — Acquisition Reliability and Integration Validation, not another feature-development milestone.
+
+## Milestone exit checklist
+
+0/8
+
+Build the solution and resolve all XAML/compiler errors.
+
+Verify Basler Pylon emulation still discovers cameras in KWinSprint.
+
+Verify the custom TCP client can list, open, stream, stop, and close a camera.
+
+Fix deterministic receiver shutdown and stop/restart behavior.
+
+Resolve configuration synchronization and FPS consistency.
+
+Reject unsupported pixel formats and invalid frame headers.
+
+Add integration tests for disconnects, repeated start/stop, and multiple clients.
+
+Run a sustained streaming test and record actual FPS, dropped frames, and memory behavior.
+
+Once these criteria pass, you can move on to the next feature milestone: better camera preview, configuration management, diagnostics, and fault injection.
+
+## 5. My recommendation
+
+Keep the UI commit, but do not treat the overall simulator milestone as complete yet. The latest UI change is well scoped and appears to preserve the existing integration paths. The remaining risk is in the shared control/frame transport and acquisition lifecycle, not the visual redesign.
+
+I would tackle the transport and shutdown fixes first, then build and test both KWinSprint integration paths separately. That sequence gives you the best chance of improving the product without disrupting the desktop application's existing camera workflow.
+
+
+I also want to highlight the thing that when I stop or close the simulated camera tool, under the KWinSprint desktop app, the simulated camera still can be reachable and still can show frame. Please also help resolve this issue, as expected, if the camera is closed/stopped, then KWinSprint shouldn't connect and receive the video frame.
+This should be treated as a camera lifecycle and resource-ownership bug, not just a UI issue.
+
+Your expected behavior is correct: when the simulator is stopped, or when its application is closed, KWinSprint must not be able to continue receiving frames from that simulator. We also need to prevent KWinSprint from silently reconnecting to a camera that should no longer be available.
+
+There are two distinct camera paths in this project, and both need explicit handling:
+
+Custom TCP simulator: KWinSprint connects through RemoteSimulatedCamera. Stopping the simulator must terminate the server, close client sockets, cancel frame streaming, and prevent further frames from being delivered.
+
+Basler Pylon emulation: KWinSprint discovers cameras through the Basler SDK using PYLON_CAMEMU. Stopping the simulator UI does not necessarily stop SDK-managed emulation or invalidate cameras that KWinSprint has already opened. This path must be tested and managed separately.
+
+A particularly important distinction: closing the simulator window should shut down its resources even if KWinSprint is still running. It should not depend on KWinSprint voluntarily disconnecting first.
+
+1. Code changes I recommend
+A. Fix server shutdown so all TCP clients are disconnected
+File: CameraSimulatorServer.cs
+
+The current StopAsync() disposes client sessions but does not await their completion. Make shutdown deterministic, and ensure every session's socket is closed before the server reports itself stopped.
+
+Add task tracking to the server:
+
+private Task? _acceptTask;
+private readonly SemaphoreSlim _stopLock = new(1, 1);
+
+In Start(), retain the accept-loop task:
+
+_acceptTask = AcceptLoopAsync(_serverCts.Token);
+
+Replace StopAsync() with this pattern:
+
+public async Task StopAsync()
+{
+    await _stopLock.WaitAsync();
+
+    try
+    {
+        var listener = _listener;
+        if (listener == null)
+            return;
+
+        // Stop accepting new clients.
+        _serverCts?.Cancel();
+        listener.Stop();
+        _listener = null;
+
+        // Snapshot before sessions remove themselves.
+        var sessions = _sessions.Values.ToArray();
+
+        // Close sockets first so pending reads and writes unblock.
+        foreach (var session in sessions)
+        {
+            try { session.Dispose(); }
+            catch (Exception ex) { Log($"Session shutdown: {ex.Message}"); }
+        }
+
+        // Wait for the accept loop to exit.
+        if (_acceptTask != null)
+        {
+            try { await _acceptTask; }
+            catch (OperationCanceledException) { }
+            catch (SocketException) { }
+        }
+
+        // Wait for session handlers to finish unwinding.
+        await Task.WhenAll(sessions.Select(s => s.Completion));
+
+        _sessions.Clear();
+        ConnectionCountChanged?.Invoke(0);
+
+        foreach (var cam in _cameras.Values)
+        {
+            cam.IsStreaming = false;
+            cam.ActualFps = 0;
+            cam.FramesSent = 0;
+            CameraUpdated?.Invoke(cam);
+        }
+
+        _serverCts?.Dispose();
+        _serverCts = null;
+        _acceptTask = null;
+
+        Log("Server stopped; all client sessions closed.");
+    }
+    finally
+    {
+        _stopLock.Release();
+    }
+}
+
+This requires a Completion task on ClientSession and a small adjustment to how RunAsync() is started. For example:
+
+public Task Completion { get; private set; } = Task.CompletedTask;
+
+public void Start(CancellationToken serverToken)
+{
+    Completion = RunAsync(serverToken);
+}
+
+Then change the accept loop to call session.Start(ct) instead of discarding the task returned by RunAsync().
+
+Important: ClientSession.Dispose() must close the underlying TcpClient/network stream, not just cancel the frame-generation token. Closing the socket is what releases a client blocked in a network read.
+
+This patch pattern needs to be integrated with the existing session cleanup carefully; it has not been compiled or tested against your repository.
+
+B. Mark KWinSprint's remote camera disconnected when the server disappears
+File: RemoteSimulatedCamera.cs
+
+There is another lifecycle defect: when ReceiveLoop() exits because the server closes the connection, it currently does not reliably reset _isOpen or IsCollecting. KWinSprint may therefore retain a stale camera state.
+
+Add a finally block to ReceiveLoop() so a remote disconnect updates the camera state:
+
+private void ReceiveLoop(object? state)
+{
+    var ct = (CancellationToken)state!;
+    byte[] headerBuffer =
+        new byte[KW.CameraSimulator.Protocol.CameraProtocol.FrameHeaderSize];
+
+    try
+    {
+        while (!ct.IsCancellationRequested && _stream != null)
+        {
+            if (!ReadExact(_stream, headerBuffer, headerBuffer.Length))
+                break;
+
+            if (!KW.CameraSimulator.Protocol.CameraProtocol.TryParseFrameHeader(
+                    headerBuffer,
+                    out int width,
+                    out int height,
+                    out int pixelFormat,
+                    out int byteCount))
+            {
+                _stats.OnFrameDropped();
+                break;
+            }
+
+            if (pixelFormat !=
+                KW.CameraSimulator.Protocol.CameraProtocol.PixelFormatBgr24)
+            {
+                _stats.OnFrameDropped();
+                break;
+            }
+
+            KW.CameraSimulator.Protocol.FrameTransport
+                .ValidateBgr24PayloadLength(width, height, byteCount);
+
+            byte[] pixels = new byte[byteCount];
+
+            if (!ReadExact(_stream, pixels, byteCount))
+                break;
+
+            _frameWidth = width;
+            _frameHeight = height;
+            _stats.OnFrameReceived();
+
+            RaiseFrameReceived(new CameraFrameEventArgs(
+                width,
+                height,
+                CameraPixelFormat.Bgr24,
+                pixels,
+                DateTime.UtcNow));
+
+            if (IsRecording && !_isRecordingPaused)
+                WriteRecordedFrame(pixels, width, height);
+        }
+    }
+    catch (IOException ex)
+    {
+        if (!ct.IsCancellationRequested)
+            _errorMessage = $"Simulator connection lost: {ex.Message}";
+    }
+    catch (ObjectDisposedException)
+    {
+        // Expected when the simulator shuts down the connection.
+    }
+    catch (Exception ex)
+    {
+        if (!ct.IsCancellationRequested)
+            _errorMessage = $"Remote frame receiver failed: {ex.Message}";
+    }
+    finally
+    {
+        IsCollecting = false;
+
+        if (!ct.IsCancellationRequested)
+            _isOpen = false;
+
+        if (!ct.IsCancellationRequested)
+        {
+            try { _stream?.Dispose(); } catch { }
+            try { _tcpClient?.Dispose(); } catch { }
+
+            _stream = null;
+            _tcpClient = null;
+        }
+    }
+}
+
+This is an illustrative replacement for the receiver loop; preserve any additional recording or synchronization behavior in your current implementation when integrating it.
+
+A deliberate StopCollect() should continue to be distinguished from an unexpected disconnection. Also, because the UI may cache the last rendered bitmap, stopping frame delivery and clearing the last preview image are separate operations. KWinSprint's preview should clear its image and show a disconnected state when the camera reports that its stream has ended.
+
+C. Make closing the WPF window asynchronous
+File: MainWindow.xaml.cs
+
+The current code blocks the UI thread with:
+
+_vm.StopServerAsync().Wait(TimeSpan.FromSeconds(3));
+
+Replace it with an asynchronous closing flow to avoid blocking the UI while shutdown is in progress:
+
+private bool _shutdownComplete;
+
+protected override async void OnClosing(
+    System.ComponentModel.CancelEventArgs e)
+{
+    if (_shutdownComplete)
+    {
+        base.OnClosing(e);
+        return;
+    }
+
+    e.Cancel = true;
+    IsEnabled = false;
+
+    try
+    {
+        await _vm.StopServerAsync();
+    }
+    catch (Exception ex)
+    {
+        MessageBox.Show(
+            $"The simulator could not shut down cleanly:\n{ex.Message}",
+            "Shutdown error",
+            MessageBoxButton.OK,
+            MessageBoxImage.Warning);
+    }
+    finally
+    {
+        _shutdownComplete = true;
+        Close();
+    }
+}
+
+This should be paired with the server task tracking above so the window doesn't close while sessions are still running.
+
+2. The important distinction: Pylon emulation vs. the TCP simulator
+These changes address the custom TCP camera path. Your repository also supports Basler Pylon emulation, and that has a different lifecycle.
+
+Scenario
+
+Expected behavior
+
+Stop the custom TCP server
+
+New connections fail; existing client sockets close; no further frames arrive.
+
+Close the simulator tool
+
+Same shutdown behavior as stopping the server.
+
+Stop acquisition in KWinSprint
+
+The server stops streaming to that session.
+
+Stop the tool while KWinSprint uses RemoteSimulatedCamera
+
+KWinSprint detects the broken connection, stops acquisition, and clears the preview.
+
+Stop the tool while KWinSprint uses PYLON_CAMEMU
+
+The emulated camera may remain available inside the already-running KWinSprint process.
+
+The last case is the key limitation. PYLON_CAMEMU is an environment setting consumed by the Basler runtime; it is not a live connection to your simulator's TCP server. Once the Pylon emulation components are loaded in KWinSprint, stopping this separate WPF tool cannot reliably revoke the already-loaded emulated camera.
+
+Your current EnableCameraEmulation() also writes PYLON_CAMEMU to user scope, which persists after the simulator tool exits. That should not be used as the default lifecycle mechanism.
+
+For strict shutdown semantics, I recommend:
+
+Use RemoteSimulatedCamera as the lifecycle-controlled path when KWinSprint must stop receiving frames as soon as the simulator stops.
+
+Set PYLON_CAMEMU only in the environment of a KWinSprint process launched by the tool, rather than changing the persistent user environment by default.
+
+If you need to stop a Pylon-emulated camera that is already open in KWinSprint, explicitly close/reinitialize that camera through the KWinSprint camera lifecycle, or terminate the KWinSprint process if that is the intended product behavior. Removing the environment variable alone will not unload the emulator from a running process.
+
+3. Acceptance tests
+Before marking this issue resolved, test these scenarios:
+
+
+Connect KWinSprint, start streaming, then stop the simulator server.
+
+Restart the simulator and verify that KWinSprint cannot reuse a stale connection.
+
+Close the simulator window while streaming and verify that all TCP sessions terminate.
+
+Stop acquisition and verify that the frame count stops increasing.
+
+Disconnect the network cable or kill the simulator process and verify that KWinSprint reports the camera as disconnected.
+
+Run the same shutdown test with PYLON_CAMEMU and verify its separate lifecycle behavior.
+0 of 6 tests checked
+
+My recommendation: resolve the TCP shutdown and KWinSprint disconnect-state bugs first. Then decide whether Pylon emulation should remain a separate development mode or whether all simulator cameras should use the custom TCP path. That architectural decision determines whether stopping the simulator can reliably make every simulated camera unavailable without also closing KWinSprint.

@@ -12,7 +12,7 @@ public class VirtualCameraState : INotifyPropertyChanged
     private string _displayName = string.Empty;
     private int _width = 640;
     private int _height = 480;
-    private int _fps = 100;
+    private double _fps = 100;
     private string _testPattern = TestPatterns.ColorBars;
     private bool _enabled = true;
     private bool _isStreaming;
@@ -35,7 +35,7 @@ public class VirtualCameraState : INotifyPropertyChanged
         set { if (_height != value) { _height = value; OnPropertyChanged(); Validate(); } }
     }
 
-    public int Fps
+    public double Fps
     {
         get => _fps;
         set { if (_fps != value) { _fps = value; OnPropertyChanged(); Validate(); } }

@@ -13,6 +13,7 @@ public sealed class RemoteSimulatedCamera : CameraBase
 {
     private const string SimulatorHost = "127.0.0.1";
     private const int SimulatorPort = 5270;
+    private const int SimulatorFramePort = 5271;
     private const int ConnectTimeoutMs = 2000;
     private const int DefaultFrameWidth = 640;
     private const int DefaultFrameHeight = 480;
@@ -30,6 +31,8 @@ public sealed class RemoteSimulatedCamera : CameraBase
 
     private TcpClient? _tcpClient;
     private NetworkStream? _stream;
+    private TcpClient? _frameTcpClient;
+    private NetworkStream? _frameStream;
     private Thread? _receiveThread;
     private CancellationTokenSource? _receiveCts;
 
@@ -208,6 +211,11 @@ public sealed class RemoteSimulatedCamera : CameraBase
         }
         catch { }
 
+        _frameStream?.Dispose();
+        _frameStream = null;
+        _frameTcpClient?.Dispose();
+        _frameTcpClient = null;
+
         _stream?.Dispose();
         _stream = null;
         _tcpClient?.Dispose();
@@ -226,10 +234,53 @@ public sealed class RemoteSimulatedCamera : CameraBase
         try
         {
             SendCommand(_stream!, "START");
-            string response = ReadLine(_stream!, 3000);
-            if (!string.Equals(response, "OK", StringComparison.OrdinalIgnoreCase))
+            string startResp = ReadLine(_stream!, 3000);
+
+            string? streamId = null;
+            if (!string.IsNullOrWhiteSpace(startResp) &&
+                startResp.StartsWith("OK ", StringComparison.OrdinalIgnoreCase))
             {
-                _errorMessage = $"启动远程采集失败：{response}";
+                int eqIdx = startResp.IndexOf("sid=", StringComparison.OrdinalIgnoreCase);
+                if (eqIdx >= 0) streamId = startResp.Substring(eqIdx + 4).Trim();
+            }
+
+            if (string.IsNullOrWhiteSpace(streamId))
+            {
+                _errorMessage = $"启动远程采集失败：{startResp}";
+                return false;
+            }
+
+            try
+            {
+                _frameTcpClient = new TcpClient();
+                if (!_frameTcpClient.ConnectAsync(SimulatorHost, SimulatorFramePort).Wait(ConnectTimeoutMs))
+                {
+                    _errorMessage = $"无法连接到模拟器帧端口 {SimulatorHost}:{SimulatorFramePort}（超时）。";
+                    _frameTcpClient.Dispose();
+                    _frameTcpClient = null;
+                    return false;
+                }
+
+                _frameStream = _frameTcpClient.GetStream();
+                SendCommand(_frameStream, $"FRAME_AUTH {streamId}");
+                string authResp = ReadLine(_frameStream, 3000);
+                if (!string.Equals(authResp, "OK", StringComparison.OrdinalIgnoreCase))
+                {
+                    _errorMessage = $"帧通道认证失败：{authResp}";
+                    _frameStream.Dispose();
+                    _frameStream = null;
+                    _frameTcpClient.Dispose();
+                    _frameTcpClient = null;
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                _errorMessage = $"帧通道连接异常：{ex.Message}";
+                _frameStream?.Dispose();
+                _frameStream = null;
+                _frameTcpClient?.Dispose();
+                _frameTcpClient = null;
                 return false;
             }
 
@@ -255,11 +306,18 @@ public sealed class RemoteSimulatedCamera : CameraBase
 
         try { SendCommand(_stream!, "STOP"); } catch { }
 
+        try { _frameStream?.Close(); } catch { }
+
         _receiveCts?.Cancel();
         _receiveThread?.Join(2000);
         _receiveCts?.Dispose();
         _receiveCts = null;
         _receiveThread = null;
+
+        _frameStream?.Dispose();
+        _frameStream = null;
+        _frameTcpClient?.Dispose();
+        _frameTcpClient = null;
 
         IsCollecting = false;
         _errorMessage = string.Empty;
@@ -270,15 +328,22 @@ public sealed class RemoteSimulatedCamera : CameraBase
     {
         var ct = (CancellationToken)state!;
         byte[] headerBuffer = new byte[KW.CameraSimulator.Protocol.CameraProtocol.FrameHeaderSize];
+        var frameStream = _frameStream;
 
         try
         {
-            while (!ct.IsCancellationRequested && _stream != null)
+            while (!ct.IsCancellationRequested && frameStream != null && _frameStream != null)
             {
-                if (!ReadExact(_stream, headerBuffer, headerBuffer.Length)) break;
+                if (!ReadExact(_frameStream, headerBuffer, headerBuffer.Length)) break;
 
                 if (!KW.CameraSimulator.Protocol.CameraProtocol.TryParseFrameHeader(
                     headerBuffer, out int width, out int height, out int pixelFormat, out int byteCount))
+                {
+                    _stats.OnFrameDropped();
+                    break;
+                }
+
+                if (pixelFormat != KW.CameraSimulator.Protocol.CameraProtocol.PixelFormatBgr24)
                 {
                     _stats.OnFrameDropped();
                     break;
@@ -296,7 +361,7 @@ public sealed class RemoteSimulatedCamera : CameraBase
                 }
 
                 byte[] pixels = new byte[byteCount];
-                if (!ReadExact(_stream, pixels, byteCount)) break;
+                if (!ReadExact(_frameStream, pixels, byteCount)) break;
 
                 _frameWidth = width;
                 _frameHeight = height;
@@ -314,10 +379,36 @@ public sealed class RemoteSimulatedCamera : CameraBase
                 }
             }
         }
+        catch (IOException ex)
+        {
+            if (!ct.IsCancellationRequested)
+                _errorMessage = $"Simulator connection lost: {ex.Message}";
+        }
+        catch (ObjectDisposedException) { }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            _errorMessage = $"远程帧接收异常：{ex.Message}";
+            if (!ct.IsCancellationRequested)
+                _errorMessage = $"远程帧接收异常：{ex.Message}";
+        }
+        finally
+        {
+            IsCollecting = false;
+
+            if (!ct.IsCancellationRequested)
+                _isOpen = false;
+
+            if (!ct.IsCancellationRequested)
+            {
+                try { _frameStream?.Dispose(); } catch { }
+                try { _frameTcpClient?.Dispose(); } catch { }
+                _frameStream = null;
+                _frameTcpClient = null;
+                try { _stream?.Dispose(); } catch { }
+                try { _tcpClient?.Dispose(); } catch { }
+                _stream = null;
+                _tcpClient = null;
+            }
         }
     }
 

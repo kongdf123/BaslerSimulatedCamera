@@ -6,6 +6,7 @@ namespace KW.CameraSimulatorTool;
 public partial class MainWindow : Window
 {
     private readonly SimulatorViewModel _vm;
+    private bool _shutdownComplete;
 
     public MainWindow()
     {
@@ -24,9 +25,33 @@ public partial class MainWindow : Window
         await _vm.StopServerAsync();
     }
 
-    protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+    protected override async void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
-        _vm.StopServerAsync().Wait(TimeSpan.FromSeconds(3));
-        base.OnClosing(e);
+        if (_shutdownComplete)
+        {
+            base.OnClosing(e);
+            return;
+        }
+
+        e.Cancel = true;
+        IsEnabled = false;
+
+        try
+        {
+            await _vm.StopServerAsync();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"The simulator could not shut down cleanly:\n{ex.Message}",
+                "Shutdown error",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+        finally
+        {
+            _shutdownComplete = true;
+            Close();
+        }
     }
 }

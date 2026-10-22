@@ -5,6 +5,8 @@ namespace KW.CameraSimulator.Protocol;
 public static class CameraProtocol
 {
     public const int DefaultPort = 5270;
+    public const int FramePortOffset = 1;
+    public static int DefaultFramePort => DefaultPort + FramePortOffset;
     public const string DefaultHost = "127.0.0.1";
 
     public const string CmdList = "LIST";
@@ -17,6 +19,8 @@ public static class CameraProtocol
     public const string CmdGetConfig = "GET_CONFIG";
     public const string CmdSetConfig = "SET_CONFIG";
     public const string CmdGetStatus = "GET_STATUS";
+
+    public const string CmdFrameAuth = "FRAME_AUTH";
 
     public const string RespOk = "OK";
     public const string RespError = "ERROR";
@@ -68,6 +72,9 @@ public static class CameraProtocol
         byteCount = BitConverter.ToInt32(header, 12);
 
         if (width <= 0 || height <= 0 || byteCount <= 0)
+            return false;
+
+        if (pixelFormat != PixelFormatBgr24)
             return false;
 
         try

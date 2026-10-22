@@ -12,11 +12,25 @@ namespace KW.CameraSimulatorTool.Services;
 
 public class CameraSimulatorServer : IDisposable
 {
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
     private readonly ConcurrentDictionary<string, VirtualCameraState> _cameras;
-    private readonly ConcurrentDictionary<string, ClientSession> _sessions = new();
-    private TcpListener? _listener;
+    private readonly ConcurrentDictionary<string, ControlSession> _controlSessions = new();
+    private readonly ConcurrentDictionary<string, FrameSession> _frameSessions = new();
+    private readonly ConcurrentDictionary<string, PendingStream> _pendingStreams = new();
+
+    private TcpListener? _controlListener;
+    private TcpListener? _frameListener;
     private CancellationTokenSource? _serverCts;
+    private Task? _controlAcceptTask;
+    private Task? _frameAcceptTask;
+
+    private readonly SemaphoreSlim _stopLock = new(1, 1);
     private int _port;
+    private int _framePort;
     private bool _disposed;
     private bool _allowRemoteConnections;
 
@@ -32,28 +46,47 @@ public class CameraSimulatorServer : IDisposable
             cameras.ToDictionary(c => c.SerialNumber, c => c));
     }
 
-    public bool IsRunning => _listener != null;
+    public bool IsRunning => _controlListener != null;
     public int Port => _port;
+    public int FramePort => _framePort;
     public bool AllowRemoteConnections => _allowRemoteConnections;
-    public int ConnectedClients => _sessions.Count;
+    public int ConnectedClients => _controlSessions.Count;
 
     public void Start(int port, bool allowRemoteConnections = false)
     {
-        if (_listener != null)
+        if (_controlListener != null)
             throw new InvalidOperationException("Server is already running.");
 
         _port = port;
+        _framePort = port + CameraProtocol.FramePortOffset;
         _allowRemoteConnections = allowRemoteConnections;
         _serverCts = new CancellationTokenSource();
 
         IPAddress address = allowRemoteConnections ? IPAddress.Any : IPAddress.Loopback;
-        _listener = new TcpListener(address, port);
-        _listener.Start();
+
+        _controlListener = new TcpListener(address, port);
+        _controlListener.Start();
+
+        try
+        {
+            _frameListener = new TcpListener(address, _framePort);
+            _frameListener.Start();
+        }
+        catch (SocketException ex)
+        {
+            _controlListener.Stop();
+            _controlListener = null;
+            _serverCts.Dispose();
+            _serverCts = null;
+            throw new InvalidOperationException(
+                $"Frame port {_framePort} is already in use. Choose a different control port.", ex);
+        }
 
         string bindInfo = allowRemoteConnections ? "0.0.0.0" : "127.0.0.1";
-        Log($"TCP server listening on {bindInfo}:{port}");
+        Log($"TCP server listening on {bindInfo}:{port} (control) + {_framePort} (frame)");
 
-        _ = AcceptLoopAsync(_serverCts.Token);
+        _controlAcceptTask = AcceptControlLoopAsync(_serverCts.Token);
+        _frameAcceptTask = AcceptFrameLoopAsync(_serverCts.Token);
     }
 
     public Task StartAsync(int port, bool allowRemoteConnections = false)
@@ -64,49 +97,169 @@ public class CameraSimulatorServer : IDisposable
 
     public async Task StopAsync()
     {
-        if (_listener == null)
-            return;
-
-        _serverCts?.Cancel();
-        _listener.Stop();
-        _listener = null;
-
-        foreach (var session in _sessions.Values)
+        await _stopLock.WaitAsync();
+        try
         {
-            try { session.Dispose(); } catch { }
-        }
-        _sessions.Clear();
+            if (_controlListener == null) return;
 
-        foreach (var cam in _cameras.Values)
+            _serverCts?.Cancel();
+
+            var controlSessions = _controlSessions.Values.ToArray();
+            var frameSessions = _frameSessions.Values.ToArray();
+
+            try { _frameListener?.Stop(); } catch { }
+            _frameListener = null;
+            try { _controlListener.Stop(); } catch { }
+            _controlListener = null;
+
+            foreach (var session in frameSessions)
+            {
+                try { session.Dispose(); }
+                catch (Exception ex) { Log($"Frame session shutdown: {ex.Message}"); }
+            }
+
+            foreach (var session in controlSessions)
+            {
+                try { session.Dispose(); }
+                catch (Exception ex) { Log($"Control session shutdown: {ex.Message}"); }
+            }
+
+            _pendingStreams.Clear();
+
+            if (_frameAcceptTask != null)
+            {
+                try { await _frameAcceptTask; }
+                catch (OperationCanceledException) { }
+                catch (SocketException) { }
+                catch (Exception ex) { Log($"Frame accept loop exited: {ex.Message}"); }
+            }
+
+            if (_controlAcceptTask != null)
+            {
+                try { await _controlAcceptTask; }
+                catch (OperationCanceledException) { }
+                catch (SocketException) { }
+                catch (Exception ex) { Log($"Control accept loop exited: {ex.Message}"); }
+            }
+
+            try { await Task.WhenAll(controlSessions.Select(s => s.Completion)); }
+            catch (Exception ex) { Log($"Control session completion: {ex.Message}"); }
+
+            try { await Task.WhenAll(frameSessions.Select(s => s.Completion)); }
+            catch (Exception ex) { Log($"Frame session completion: {ex.Message}"); }
+
+            _controlSessions.Clear();
+            _frameSessions.Clear();
+            ConnectionCountChanged?.Invoke(0);
+
+            foreach (var cam in _cameras.Values)
+            {
+                cam.IsStreaming = false;
+                cam.ActualFps = 0;
+                cam.FramesSent = 0;
+                CameraUpdated?.Invoke(cam);
+            }
+
+            _serverCts?.Dispose();
+            _serverCts = null;
+            _controlAcceptTask = null;
+            _frameAcceptTask = null;
+
+            Log("Server stopped; all sessions closed.");
+        }
+        finally
         {
-            cam.IsStreaming = false;
-            cam.FramesSent = 0;
-            cam.ActualFps = 0;
-            CameraUpdated?.Invoke(cam);
+            _stopLock.Release();
         }
-
-        Log("Server stopped.");
-        await Task.CompletedTask;
     }
 
-    private async Task AcceptLoopAsync(CancellationToken ct)
+    private async Task AcceptControlLoopAsync(CancellationToken ct)
     {
-        while (!ct.IsCancellationRequested && _listener != null)
+        while (!ct.IsCancellationRequested && _controlListener != null)
         {
             try
             {
-                var client = await _listener.AcceptTcpClientAsync(ct);
-                var session = new ClientSession(client, this);
-                _sessions[session.Id] = session;
-                ConnectionCountChanged?.Invoke(_sessions.Count);
-                Log($"Client connected: {session.RemoteEndPoint} ({session.Id})");
-                _ = session.RunAsync(ct);
+                var client = await _controlListener.AcceptTcpClientAsync(ct);
+                var session = new ControlSession(client, this);
+                _controlSessions[session.Id] = session;
+                ConnectionCountChanged?.Invoke(_controlSessions.Count);
+                Log($"Control client connected: {session.RemoteEndPoint} ({session.Id})");
+                session.Start(ct);
             }
             catch (OperationCanceledException) { break; }
-            catch (Exception ex)
+            catch (SocketException) { break; }
+            catch (Exception ex) { Log($"Control accept error: {ex.Message}"); }
+        }
+    }
+
+    private async Task AcceptFrameLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested && _frameListener != null)
+        {
+            try
             {
-                Log($"Accept error: {ex.Message}");
+                var client = await _frameListener.AcceptTcpClientAsync(ct);
+                var session = new FrameSession(client, this);
+                _frameSessions[session.Id] = session;
+                Log($"Frame client connected: {session.RemoteEndPoint} ({session.Id})");
+                session.Start(ct);
             }
+            catch (OperationCanceledException) { break; }
+            catch (SocketException) { break; }
+            catch (Exception ex) { Log($"Frame accept error: {ex.Message}"); }
+        }
+    }
+
+    internal bool TryRegisterPendingStream(string streamId, ControlSession controlSession, VirtualCameraState cam, int slotIndex)
+    {
+        var pending = new PendingStream(controlSession, cam, slotIndex);
+        return _pendingStreams.TryAdd(streamId, pending);
+    }
+
+    internal PendingStream? CompleteFrameAuth(string streamId, FrameSession frameSession)
+    {
+        if (_pendingStreams.TryRemove(streamId, out var pending))
+        {
+            pending.FrameSession = frameSession;
+            return pending;
+        }
+        return null;
+    }
+
+    internal void RemovePending(string streamId)
+    {
+        _pendingStreams.TryRemove(streamId, out _);
+    }
+
+    internal void CloseFrameForControl(string controlSessionId)
+    {
+        foreach (var kv in _frameSessions)
+        {
+            if (kv.Value.ControlSessionId == controlSessionId)
+            {
+                try { kv.Value.Dispose(); } catch { }
+            }
+        }
+    }
+
+    internal void RemoveControlSession(string id)
+    {
+        _controlSessions.TryRemove(id, out _);
+        CloseFrameForControl(id);
+        ConnectionCountChanged?.Invoke(_controlSessions.Count);
+    }
+
+    internal void RemoveFrameSession(string id)
+    {
+        _frameSessions.TryRemove(id, out _);
+    }
+
+    internal void NotifyControlStreamEnded(string? controlSessionId)
+    {
+        if (controlSessionId != null &&
+            _controlSessions.TryGetValue(controlSessionId, out var ctrl))
+        {
+            ctrl.OnFrameSessionEnded();
         }
     }
 
@@ -118,7 +271,7 @@ public class CameraSimulatorServer : IDisposable
 
     internal bool IsCameraStreamingByAnySession(string serial)
     {
-        return _sessions.Values.Any(s => s.IsStreaming && s.OpenCameraSerial == serial);
+        return _controlSessions.Values.Any(s => s.IsStreaming && s.OpenCameraSerial == serial);
     }
 
     internal VirtualCameraState? GetCameraForConfig(string serial)
@@ -137,24 +290,34 @@ public class CameraSimulatorServer : IDisposable
         LogMessage?.Invoke(message);
     }
 
-    internal void RemoveSession(string id)
-    {
-        _sessions.TryRemove(id, out _);
-        ConnectionCountChanged?.Invoke(_sessions.Count);
-    }
-
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        try { StopAsync().Wait(TimeSpan.FromSeconds(2)); } catch { }
+        try { StopAsync().Wait(TimeSpan.FromSeconds(3)); } catch { }
         _serverCts?.Dispose();
+        _stopLock.Dispose();
     }
 
-    private class ClientSession : IDisposable
+    internal sealed class PendingStream
+    {
+        public ControlSession Control { get; }
+        public VirtualCameraState Camera { get; }
+        public int SlotIndex { get; }
+        public FrameSession? FrameSession { get; set; }
+
+        public PendingStream(ControlSession control, VirtualCameraState camera, int slotIndex)
+        {
+            Control = control;
+            Camera = camera;
+            SlotIndex = slotIndex;
+        }
+    }
+
+    internal class ControlSession : IDisposable
     {
         private static int _nextId;
-        public string Id { get; } = $"client-{Interlocked.Increment(ref _nextId)}";
+        public string Id { get; } = $"control-{Interlocked.Increment(ref _nextId)}";
         public string RemoteEndPoint { get; }
 
         private readonly TcpClient _client;
@@ -164,15 +327,16 @@ public class CameraSimulatorServer : IDisposable
         private readonly StreamWriter _writer;
         private readonly SemaphoreSlim _writeLock = new(1, 1);
         private VirtualCameraState? _openCamera;
-        private CancellationTokenSource? _streamCts;
         private bool _disposed;
         private bool _isStreaming;
         private int _slotIndex;
+        private string? _activeStreamId;
 
+        public Task Completion { get; private set; } = Task.CompletedTask;
         public bool IsStreaming => _isStreaming;
         public string? OpenCameraSerial => _openCamera?.SerialNumber;
 
-        public ClientSession(TcpClient client, CameraSimulatorServer server)
+        public ControlSession(TcpClient client, CameraSimulatorServer server)
         {
             _client = client;
             _server = server;
@@ -180,6 +344,11 @@ public class CameraSimulatorServer : IDisposable
             _reader = new StreamReader(_stream, Encoding.ASCII, leaveOpen: true);
             _writer = new StreamWriter(_stream, Encoding.ASCII, leaveOpen: true) { AutoFlush = true };
             RemoteEndPoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+        }
+
+        public void Start(CancellationToken serverToken)
+        {
+            Completion = RunAsync(serverToken);
         }
 
         public async Task RunAsync(CancellationToken serverCt)
@@ -199,15 +368,12 @@ public class CameraSimulatorServer : IDisposable
             }
             catch (OperationCanceledException) { }
             catch (IOException) { }
-            catch (Exception ex)
-            {
-                _server.Log($"Session {Id} error: {ex.Message}");
-            }
+            catch (Exception ex) { _server.Log($"Session {Id} error: {ex.Message}"); }
             finally
             {
                 StopStreaming();
-                _server.RemoveSession(Id);
-                _server.Log($"Client disconnected: {RemoteEndPoint} ({Id})");
+                _server.RemoveControlSession(Id);
+                _server.Log($"Control client disconnected: {RemoteEndPoint} ({Id})");
             }
         }
 
@@ -219,53 +385,24 @@ public class CameraSimulatorServer : IDisposable
 
             switch (cmd)
             {
-                case CameraProtocol.CmdList:
-                    await SendListAsync();
-                    break;
-                case CameraProtocol.CmdOpen:
-                    await HandleOpenAsync(remainder);
-                    break;
-                case CameraProtocol.CmdStart:
-                    await HandleStartAsync(ct);
-                    break;
-                case CameraProtocol.CmdStop:
-                    StopStreaming();
-                    await SendAsync(CameraProtocol.RespOk);
-                    break;
-                case CameraProtocol.CmdClose:
-                    StopStreaming();
-                    _openCamera = null;
-                    await SendAsync(CameraProtocol.RespOk);
-                    break;
-                case CameraProtocol.CmdPing:
-                    await SendAsync(CameraProtocol.RespPong);
-                    break;
-                case CameraProtocol.CmdGetFeatures:
-                    await HandleGetFeaturesAsync(remainder);
-                    break;
-                case CameraProtocol.CmdGetConfig:
-                    await HandleGetConfigAsync(remainder);
-                    break;
-                case CameraProtocol.CmdSetConfig:
-                    await HandleSetConfigAsync(remainder);
-                    break;
-                case CameraProtocol.CmdGetStatus:
-                    await HandleGetStatusAsync(remainder);
-                    break;
-                default:
-                    await SendAsync($"{CameraProtocol.RespError} unknown command: {cmd}");
-                    break;
+                case CameraProtocol.CmdList: await SendListAsync(); break;
+                case CameraProtocol.CmdOpen: await HandleOpenAsync(remainder); break;
+                case CameraProtocol.CmdStart: await HandleStartAsync(ct); break;
+                case CameraProtocol.CmdStop: StopStreaming(); await SendAsync(CameraProtocol.RespOk); break;
+                case CameraProtocol.CmdClose: StopStreaming(); _openCamera = null; await SendAsync(CameraProtocol.RespOk); break;
+                case CameraProtocol.CmdPing: await SendAsync(CameraProtocol.RespPong); break;
+                case CameraProtocol.CmdGetFeatures: await HandleGetFeaturesAsync(remainder); break;
+                case CameraProtocol.CmdGetConfig: await HandleGetConfigAsync(remainder); break;
+                case CameraProtocol.CmdSetConfig: await HandleSetConfigAsync(remainder); break;
+                case CameraProtocol.CmdGetStatus: await HandleGetStatusAsync(remainder); break;
+                default: await SendAsync($"{CameraProtocol.RespError} unknown command: {cmd}"); break;
             }
         }
 
         private async Task SendListAsync()
         {
-            var infos = _server.Cameras
-                .Where(c => c.Enabled)
-                .Select(c => c.ToInfo())
-                .ToArray();
-            string json = JsonSerializer.Serialize(infos);
-            await SendAsync(json);
+            var infos = _server.Cameras.Where(c => c.Enabled).Select(c => c.ToInfo()).ToArray();
+            await SendAsync(JsonSerializer.Serialize(infos));
         }
 
         private async Task HandleOpenAsync(string? remainder)
@@ -316,35 +453,58 @@ public class CameraSimulatorServer : IDisposable
                 return;
             }
 
+            string streamId = Guid.NewGuid().ToString("N");
+            if (!_server.TryRegisterPendingStream(streamId, this, _openCamera, _slotIndex))
+            {
+                await SendAsync($"{CameraProtocol.RespError} could not start stream");
+                return;
+            }
+
+            _activeStreamId = streamId;
+            await SendAsync($"OK sid={streamId}");
+            _server.Log($"{Id} started streaming {_openCamera.SerialNumber} — awaiting frame connection on port {_server.FramePort}");
+        }
+
+        public void MarkStreamingActive()
+        {
+            if (_openCamera == null) return;
             _openCamera.EnsureGenerator(_slotIndex);
             _openCamera.IsStreaming = true;
-            _server.OnCameraStateChanged(_openCamera);
-            _streamCts = new CancellationTokenSource();
             _isStreaming = true;
-            await SendAsync(CameraProtocol.RespOk);
-            _ = StreamFramesAsync(_openCamera, _streamCts.Token);
-            _server.Log($"{Id} started streaming {_openCamera.SerialNumber}");
+            _server.OnCameraStateChanged(_openCamera);
         }
 
         private void StopStreaming()
         {
-            if (_streamCts != null)
+            string? id = _activeStreamId;
+            StopStreamingCore();
+            if (id != null)
+                _server.CloseFrameForControl(Id);
+        }
+
+        internal void OnFrameSessionEnded()
+        {
+            StopStreamingCore();
+        }
+
+        private void StopStreamingCore()
+        {
+            if (_activeStreamId != null)
             {
-                _streamCts.Cancel();
-                _streamCts.Dispose();
-                _streamCts = null;
+                _server.RemovePending(_activeStreamId);
+                _activeStreamId = null;
             }
             _isStreaming = false;
             if (_openCamera != null)
             {
                 _openCamera.IsStreaming = _server.IsCameraStreamingByAnySession(_openCamera.SerialNumber);
-                if (!_openCamera.IsStreaming)
-                {
-                    _openCamera.ActualFps = 0;
-                }
+                if (!_openCamera.IsStreaming) _openCamera.ActualFps = 0;
                 _server.OnCameraStateChanged(_openCamera);
             }
         }
+
+        internal VirtualCameraState? OpenCamera => _openCamera;
+        internal int SlotIndex => _slotIndex;
 
         private async Task HandleGetFeaturesAsync(string? remainder)
         {
@@ -353,18 +513,14 @@ public class CameraSimulatorServer : IDisposable
                 await SendAsync($"{CameraProtocol.RespError} usage: GET_FEATURES <serial>");
                 return;
             }
-
-            string serial = remainder.Trim();
-            var cam = _server.GetCamera(serial);
+            var cam = _server.GetCamera(remainder.Trim());
             if (cam == null)
             {
-                await SendAsync($"{CameraProtocol.RespError} camera not found: {serial}");
+                await SendAsync($"{CameraProtocol.RespError} camera not found: {remainder.Trim()}");
                 return;
             }
-
             var caps = CameraConfigurationValidator.GetCapabilities();
-            string json = JsonSerializer.Serialize(caps);
-            await SendAsync(json);
+            await SendAsync(JsonSerializer.Serialize(caps));
         }
 
         private async Task HandleGetConfigAsync(string? remainder)
@@ -374,7 +530,6 @@ public class CameraSimulatorServer : IDisposable
                 await SendAsync($"{CameraProtocol.RespError} usage: GET_CONFIG <serial>");
                 return;
             }
-
             string serial = remainder.Trim();
             var cam = _server.GetCamera(serial);
             if (cam == null)
@@ -382,7 +537,6 @@ public class CameraSimulatorServer : IDisposable
                 await SendAsync($"{CameraProtocol.RespError} camera not found: {serial}");
                 return;
             }
-
             var config = new
             {
                 width = cam.Width,
@@ -391,8 +545,7 @@ public class CameraSimulatorServer : IDisposable
                 pixelFormat = CameraProtocol.PixelFormatBgr24,
                 testPattern = cam.TestPattern,
             };
-            string json = JsonSerializer.Serialize(config);
-            await SendAsync(json);
+            await SendAsync(JsonSerializer.Serialize(config));
         }
 
         private async Task HandleSetConfigAsync(string? remainder)
@@ -402,14 +555,12 @@ public class CameraSimulatorServer : IDisposable
                 await SendAsync($"{CameraProtocol.RespError} usage: SET_CONFIG <serial> <json>");
                 return;
             }
-
             int sp = remainder.IndexOf(' ');
             if (sp < 0)
             {
                 await SendAsync($"{CameraProtocol.RespError} usage: SET_CONFIG <serial> <json>");
                 return;
             }
-
             string serial = remainder.Substring(0, sp).Trim();
             string jsonPayload = remainder.Substring(sp + 1).Trim();
 
@@ -419,7 +570,6 @@ public class CameraSimulatorServer : IDisposable
                 await SendAsync($"{CameraProtocol.RespError} camera not found: {serial}");
                 return;
             }
-
             if (_server.IsCameraStreamingByAnySession(serial))
             {
                 await SendAsync($"{CameraProtocol.RespError} camera is streaming; stop before changing config");
@@ -427,57 +577,30 @@ public class CameraSimulatorServer : IDisposable
             }
 
             SetConfigPayload? payload;
-            try
-            {
-                payload = JsonSerializer.Deserialize<SetConfigPayload>(jsonPayload);
-            }
-            catch
-            {
-                await SendAsync($"{CameraProtocol.RespError} invalid JSON");
-                return;
-            }
-
-            if (payload == null)
-            {
-                await SendAsync($"{CameraProtocol.RespError} invalid config payload");
-                return;
-            }
+            try { payload = JsonSerializer.Deserialize<SetConfigPayload>(jsonPayload, JsonOpts); }
+            catch { await SendAsync($"{CameraProtocol.RespError} invalid JSON"); return; }
+            if (payload == null) { await SendAsync($"{CameraProtocol.RespError} invalid config payload"); return; }
 
             int newWidth = payload.Width ?? cam.Width;
             int newHeight = payload.Height ?? cam.Height;
             double newFps = payload.Fps ?? cam.Fps;
             string newPattern = payload.TestPattern ?? cam.TestPattern;
 
-            var config = new CameraConfiguration(
-                newWidth, newHeight, newFps,
-                SimulatedPixelFormat.Bgr24, newPattern);
-
+            var config = new CameraConfiguration(newWidth, newHeight, newFps, SimulatedPixelFormat.Bgr24, newPattern);
             string? error = CameraConfigurationValidator.Validate(config);
-            if (error != null)
-            {
-                await SendAsync($"{CameraProtocol.RespError} {error}");
-                return;
-            }
+            if (error != null) { await SendAsync($"{CameraProtocol.RespError} {error}"); return; }
 
             lock (cam.SyncRoot)
             {
                 cam.Width = newWidth;
                 cam.Height = newHeight;
-                cam.Fps = (int)Math.Round(newFps);
+                cam.Fps = newFps;
                 cam.TestPattern = newPattern;
                 cam.Generator = null;
             }
 
             _server.OnCameraStateChanged(cam);
-
-            var applied = new
-            {
-                width = cam.Width,
-                height = cam.Height,
-                fps = cam.Fps,
-                pixelFormat = CameraProtocol.PixelFormatBgr24,
-                testPattern = cam.TestPattern,
-            };
+            var applied = new { width = cam.Width, height = cam.Height, fps = cam.Fps, pixelFormat = CameraProtocol.PixelFormatBgr24, testPattern = cam.TestPattern };
             await SendAsync(JsonSerializer.Serialize(applied));
             _server.Log($"{Id} set config on {serial}: {cam.Width}x{cam.Height} @ {cam.Fps}fps pattern={cam.TestPattern}");
         }
@@ -485,51 +608,162 @@ public class CameraSimulatorServer : IDisposable
         private async Task HandleGetStatusAsync(string? remainder)
         {
             string serial = remainder?.Trim() ?? string.Empty;
-
             if (string.IsNullOrEmpty(serial))
             {
-                var statuses = _server.Cameras
-                    .Select(c => new
-                    {
-                        serial = c.SerialNumber,
-                        enabled = c.Enabled,
-                        streaming = c.IsStreaming,
-                        framesSent = c.FramesSent,
-                        actualFps = Math.Round(c.ActualFps, 2),
-                    })
-                    .ToArray();
+                var statuses = _server.Cameras.Select(c => new
+                {
+                    serial = c.SerialNumber, enabled = c.Enabled, streaming = c.IsStreaming,
+                    framesSent = c.FramesSent, actualFps = Math.Round(c.ActualFps, 2),
+                }).ToArray();
                 await SendAsync(JsonSerializer.Serialize(statuses));
                 return;
             }
-
             var cam = _server.GetCamera(serial);
-            if (cam == null)
-            {
-                await SendAsync($"{CameraProtocol.RespError} camera not found: {serial}");
-                return;
-            }
-
-            var single = new
-            {
-                serial = cam.SerialNumber,
-                enabled = cam.Enabled,
-                streaming = cam.IsStreaming,
-                framesSent = cam.FramesSent,
-                actualFps = Math.Round(cam.ActualFps, 2),
-            };
+            if (cam == null) { await SendAsync($"{CameraProtocol.RespError} camera not found: {serial}"); return; }
+            var single = new { serial = cam.SerialNumber, enabled = cam.Enabled, streaming = cam.IsStreaming, framesSent = cam.FramesSent, actualFps = Math.Round(cam.ActualFps, 2) };
             await SendAsync(JsonSerializer.Serialize(single));
         }
 
-        private async Task StreamFramesAsync(VirtualCameraState cam, CancellationToken ct)
+        private async Task SendAsync(string message)
         {
+            try
+            {
+                await _writeLock.WaitAsync();
+                try
+                {
+                    await _writer.WriteLineAsync(message.AsMemory(), default);
+                    await _writer.FlushAsync();
+                }
+                finally { _writeLock.Release(); }
+            }
+            catch { }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            try { _client.Close(); } catch { }
+            try { _stream.Close(); } catch { }
+
+            StopStreaming();
+
+            try { _writer.Dispose(); } catch { }
+            try { _reader.Dispose(); } catch { }
+            try { _stream.Dispose(); } catch { }
+            try { _client.Dispose(); } catch { }
+        }
+    }
+
+    internal class FrameSession : IDisposable
+    {
+        private static int _nextId;
+        public string Id { get; } = $"frame-{Interlocked.Increment(ref _nextId)}";
+        public string RemoteEndPoint { get; }
+        public string? ControlSessionId { get; private set; }
+
+        private readonly TcpClient _client;
+        private readonly CameraSimulatorServer _server;
+        private readonly NetworkStream _stream;
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
+        private CancellationTokenSource? _streamCts;
+        private VirtualCameraState? _camera;
+        private double _targetFps;
+        private int _genWidth, _genHeight, _slotIndex;
+        private bool _disposed;
+        private bool _hasAuthed;
+
+        public Task Completion { get; private set; } = Task.CompletedTask;
+
+        public FrameSession(TcpClient client, CameraSimulatorServer server)
+        {
+            _client = client;
+            _server = server;
+            _stream = client.GetStream();
+            RemoteEndPoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+        }
+
+        public void Start(CancellationToken serverToken)
+        {
+            Completion = RunAsync(serverToken);
+        }
+
+        private async Task RunAsync(CancellationToken serverCt)
+        {
+            try
+            {
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(serverCt);
+
+                string? line = await ReadLineAsync(linked.Token);
+                if (line == null) return;
+
+                string command = line.TrimEnd('\r', '\n');
+                if (string.IsNullOrWhiteSpace(command)) return;
+
+                int sp = command.IndexOf(' ');
+                string cmd = sp < 0 ? command.ToUpperInvariant() : command.Substring(0, sp).ToUpperInvariant();
+                string? remainder = sp < 0 ? null : command.Substring(sp + 1);
+
+                if (cmd != CameraProtocol.CmdFrameAuth || string.IsNullOrWhiteSpace(remainder))
+                {
+                    await SendAsciiAsync($"{CameraProtocol.RespError} usage: {CameraProtocol.CmdFrameAuth} <sid>");
+                    return;
+                }
+
+                string streamId = remainder.Trim();
+                var pending = _server.CompleteFrameAuth(streamId, this);
+                if (pending == null)
+                {
+                    await SendAsciiAsync($"{CameraProtocol.RespError} invalid or expired stream token");
+                    return;
+                }
+
+                ControlSessionId = pending.Control.Id;
+                _camera = pending.Camera;
+                _slotIndex = pending.SlotIndex;
+                _targetFps = pending.Camera.Fps;
+                _genWidth = pending.Camera.Width;
+                _genHeight = pending.Camera.Height;
+                _hasAuthed = true;
+
+                await SendAsciiAsync(CameraProtocol.RespOk);
+
+                pending.Control.MarkStreamingActive();
+                _server.Log($"Frame session {Id} authed for stream {streamId} (control {pending.Control.Id}, camera {pending.Camera.SerialNumber})");
+
+                _streamCts = new CancellationTokenSource();
+                await StreamFramesAsync(_streamCts.Token);
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+            catch (Exception ex) { _server.Log($"Frame session {Id} error: {ex.Message}"); }
+            finally
+            {
+                if (_hasAuthed && _camera != null)
+                {
+                    _camera.IsStreaming = _server.IsCameraStreamingByAnySession(_camera.SerialNumber);
+                    if (!_camera.IsStreaming) _camera.ActualFps = 0;
+                    _server.OnCameraStateChanged(_camera);
+                }
+                _server.NotifyControlStreamEnded(ControlSessionId);
+                _server.RemoveFrameSession(Id);
+                _server.Log($"Frame client disconnected: {RemoteEndPoint} ({Id})");
+            }
+        }
+
+        private async Task StreamFramesAsync(CancellationToken ct)
+        {
+            if (_camera == null) return;
+
+            double frameIntervalMs = 1000.0 / Math.Max(0.1, _targetFps);
             var sw = Stopwatch.StartNew();
             long framesSent = 0;
-            double frameIntervalMs = 1000.0 / Math.Max(1, cam.Fps);
             long lastFpsUpdate = 0;
 
             try
             {
-                while (!ct.IsCancellationRequested && _isStreaming)
+                while (!ct.IsCancellationRequested)
                 {
                     double targetMs = framesSent * frameIntervalMs;
                     double elapsed = sw.Elapsed.TotalMilliseconds;
@@ -547,80 +781,82 @@ public class CameraSimulatorServer : IDisposable
                         }
                     }
 
-                    if (ct.IsCancellationRequested || !_isStreaming) break;
+                    if (ct.IsCancellationRequested) break;
 
-                    cam.EnsureGenerator(_slotIndex);
-                    byte[] pixels = cam.Generator!.Generate();
+                    _camera.EnsureGenerator(_slotIndex);
+                    byte[] pixels = _camera.Generator!.Generate();
                     byte[] packet = CameraProtocol.BuildFramePacket(
-                        cam.Width, cam.Height, CameraProtocol.PixelFormatBgr24, pixels);
+                        _genWidth, _genHeight, CameraProtocol.PixelFormatBgr24, pixels);
 
                     await _writeLock.WaitAsync(ct);
-                    try
-                    {
-                        await _stream.WriteAsync(packet, 0, packet.Length, ct);
-                    }
-                    finally
-                    {
-                        _writeLock.Release();
-                    }
+                    try { await _stream.WriteAsync(packet, 0, packet.Length, ct); }
+                    finally { _writeLock.Release(); }
                     framesSent++;
 
                     if (sw.ElapsedMilliseconds - lastFpsUpdate >= 500)
                     {
-                        lock (cam.SyncRoot)
+                        lock (_camera.SyncRoot)
                         {
-                            cam.ActualFps = framesSent * 1000.0 / sw.Elapsed.TotalMilliseconds;
-                            cam.FramesSent = framesSent;
+                            _camera.ActualFps = framesSent * 1000.0 / sw.Elapsed.TotalMilliseconds;
+                            _camera.FramesSent = framesSent;
                         }
-                        _server.OnCameraStateChanged(cam);
+                        _server.OnCameraStateChanged(_camera);
                         lastFpsUpdate = sw.ElapsedMilliseconds;
                     }
                 }
             }
             catch (OperationCanceledException) { }
             catch (IOException) { }
-            catch (Exception ex)
-            {
-                _server.Log($"Stream error for {cam.SerialNumber}: {ex.Message}");
-            }
+            catch (Exception ex) { _server.Log($"Frame stream error: {ex.Message}"); }
             finally
             {
-                _isStreaming = false;
-                lock (cam.SyncRoot)
+                lock (_camera.SyncRoot)
                 {
-                    cam.FramesSent = framesSent;
-                    cam.ActualFps = 0;
+                    _camera.FramesSent = framesSent;
+                    _camera.ActualFps = 0;
                 }
-                cam.IsStreaming = _server.IsCameraStreamingByAnySession(cam.SerialNumber);
-                _server.OnCameraStateChanged(cam);
+                _server.OnCameraStateChanged(_camera);
             }
         }
 
-        private async Task SendAsync(string message)
+        private async Task SendAsciiAsync(string message)
         {
             try
             {
+                byte[] data = Encoding.ASCII.GetBytes(message + "\r\n");
                 await _writeLock.WaitAsync();
-                try
-                {
-                    await _writer.WriteLineAsync(message.AsMemory(), default);
-                    await _writer.FlushAsync();
-                }
-                finally
-                {
-                    _writeLock.Release();
-                }
+                try { await _stream.WriteAsync(data, 0, data.Length); await _stream.FlushAsync(); }
+                finally { _writeLock.Release(); }
             }
             catch { }
+        }
+
+        private async Task<string?> ReadLineAsync(CancellationToken ct)
+        {
+            var sb = new StringBuilder();
+            var buffer = new byte[1];
+            while (true)
+            {
+                int read = await _stream.ReadAsync(buffer, 0, 1, ct);
+                if (read <= 0) return null;
+                char c = (char)buffer[0];
+                if (c == '\n') break;
+                if (c != '\r') sb.Append(c);
+            }
+            return sb.ToString();
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            StopStreaming();
-            try { _writer.Dispose(); } catch { }
-            try { _reader.Dispose(); } catch { }
+
+            _streamCts?.Cancel();
+            _streamCts?.Dispose();
+            _streamCts = null;
+
+            try { _client.Close(); } catch { }
+            try { _stream.Close(); } catch { }
             try { _stream.Dispose(); } catch { }
             try { _client.Dispose(); } catch { }
         }

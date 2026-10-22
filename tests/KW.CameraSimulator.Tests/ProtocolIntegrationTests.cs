@@ -54,22 +54,24 @@ public class ProtocolIntegrationTests
             Send(stream, "OPEN SIM-CAM-01");
             Assert.Equal("OK", ReadLine(stream));
 
-            Send(stream, "START");
-            Assert.Equal("OK", ReadLine(stream));
-
-            for (int i = 0; i < 3; i++)
+            string sid = await StartAndGetSidAsync(stream);
+            var (frameClient, frameStream) = await ConnectFramePortAsync(port, sid);
+            using (frameClient)
             {
-                byte[] header = ReadExact(stream, 16);
-                int width = BitConverter.ToInt32(header, 0);
-                int height = BitConverter.ToInt32(header, 4);
-                int byteCount = BitConverter.ToInt32(header, 12);
+                for (int i = 0; i < 3; i++)
+                {
+                    byte[] header = ReadExact(frameStream, 16);
+                    int width = BitConverter.ToInt32(header, 0);
+                    int height = BitConverter.ToInt32(header, 4);
+                    int byteCount = BitConverter.ToInt32(header, 12);
 
-                Assert.Equal(640, width);
-                Assert.Equal(480, height);
-                Assert.Equal(width * height * 3, byteCount);
+                    Assert.Equal(640, width);
+                    Assert.Equal(480, height);
+                    Assert.Equal(width * height * 3, byteCount);
 
-                byte[] pixels = ReadExact(stream, byteCount);
-                Assert.Equal(byteCount, pixels.Length);
+                    byte[] pixels = ReadExact(frameStream, byteCount);
+                    Assert.Equal(byteCount, pixels.Length);
+                }
             }
 
             Send(stream, "STOP");
@@ -214,16 +216,18 @@ public class ProtocolIntegrationTests
 
             Send(stream, "OPEN SIM-CAM-01");
             Assert.Equal("OK", ReadLine(stream));
-            Send(stream, "START");
-            Assert.Equal("OK", ReadLine(stream));
+            string sid = await StartAndGetSidAsync(stream);
+            var (fc, fs) = await ConnectFramePortAsync(port, sid);
+            using (fc)
+            {
+                await Task.Delay(100);
 
-            await Task.Delay(100);
+                string jsonPayload = JsonSerializer.Serialize(new { width = 1024, height = 768 });
+                Send(stream, $"SET_CONFIG SIM-CAM-01 {jsonPayload}");
+                string resp = ReadLine(stream);
 
-            string jsonPayload = JsonSerializer.Serialize(new { width = 1024, height = 768 });
-            Send(stream, $"SET_CONFIG SIM-CAM-01 {jsonPayload}");
-            string resp = ReadLine(stream);
-
-            Assert.StartsWith("ERROR", resp);
+                Assert.StartsWith("ERROR", resp);
+            }
 
             Send(stream, "STOP");
             Assert.Equal("OK", ReadLine(stream));
@@ -290,22 +294,24 @@ public class ProtocolIntegrationTests
             Send(stream, "OPEN SIM-CAM-01");
             Assert.Equal("OK", ReadLine(stream));
 
-            Send(stream, "START");
-            Assert.Equal("OK", ReadLine(stream));
+            string sid = await StartAndGetSidAsync(stream);
+            var (frameClient, frameStream) = await ConnectFramePortAsync(port, sid);
+            using (frameClient)
+            {
+                await Task.Delay(150);
 
-            await Task.Delay(150);
+                byte[] header = ReadExact(frameStream, 16);
+                int w = BitConverter.ToInt32(header, 0);
+                int h = BitConverter.ToInt32(header, 4);
+                int byteCount = BitConverter.ToInt32(header, 12);
 
-            byte[] header = ReadExact(stream, 16);
-            int w = BitConverter.ToInt32(header, 0);
-            int h = BitConverter.ToInt32(header, 4);
-            int byteCount = BitConverter.ToInt32(header, 12);
+                Assert.Equal(1280, w);
+                Assert.Equal(720, h);
+                Assert.Equal(1280 * 720 * 3, byteCount);
 
-            Assert.Equal(1280, w);
-            Assert.Equal(720, h);
-            Assert.Equal(1280 * 720 * 3, byteCount);
-
-            byte[] pixels = ReadExact(stream, byteCount);
-            Assert.Equal(1280 * 720 * 3, pixels.Length);
+                byte[] pixels = ReadExact(frameStream, byteCount);
+                Assert.Equal(1280 * 720 * 3, pixels.Length);
+            }
 
             Send(stream, "STOP");
             Assert.Equal("OK", ReadLine(stream));
@@ -338,19 +344,23 @@ public class ProtocolIntegrationTests
 
             Send(stream1, "OPEN SIM-CAM-01");
             Assert.Equal("OK", ReadLine(stream1));
-            Send(stream1, "START");
-            Assert.Equal("OK", ReadLine(stream1));
+            string sid1 = await StartAndGetSidAsync(stream1);
+            var (fc1, fs1) = await ConnectFramePortAsync(port, sid1);
 
             Send(stream2, "OPEN SIM-CAM-02");
             Assert.Equal("OK", ReadLine(stream2));
-            Send(stream2, "START");
-            Assert.Equal("OK", ReadLine(stream2));
+            string sid2 = await StartAndGetSidAsync(stream2);
+            var (fc2, fs2) = await ConnectFramePortAsync(port, sid2);
 
-            byte[] h1 = ReadExact(stream1, 16);
-            byte[] h2 = ReadExact(stream2, 16);
+            using (fc1)
+            using (fc2)
+            {
+                byte[] h1 = ReadExact(fs1, 16);
+                byte[] h2 = ReadExact(fs2, 16);
 
-            Assert.Equal(640, BitConverter.ToInt32(h1, 0));
-            Assert.Equal(640, BitConverter.ToInt32(h2, 0));
+                Assert.Equal(640, BitConverter.ToInt32(h1, 0));
+                Assert.Equal(640, BitConverter.ToInt32(h2, 0));
+            }
         }
         finally
         {
@@ -380,30 +390,252 @@ public class ProtocolIntegrationTests
 
             Send(stream1, "OPEN SIM-CAM-01");
             Assert.Equal("OK", ReadLine(stream1));
-            Send(stream1, "START");
-            Assert.Equal("OK", ReadLine(stream1));
+            string sid1 = await StartAndGetSidAsync(stream1);
+            var (fc1, fs1) = await ConnectFramePortAsync(port, sid1);
 
             Send(stream2, "OPEN SIM-CAM-01");
             Assert.Equal("OK", ReadLine(stream2));
-            Send(stream2, "START");
-            Assert.Equal("OK", ReadLine(stream2));
+            string sid2 = await StartAndGetSidAsync(stream2);
+            var (fc2, fs2) = await ConnectFramePortAsync(port, sid2);
 
             await Task.Delay(100);
 
-            ReadExact(stream1, 16);
-            ReadExact(stream2, 16);
+            DrainOneFrame(fs1);
+            DrainOneFrame(fs2);
+
+            fc1.Dispose();
 
             Send(stream1, "STOP");
             Assert.Equal("OK", ReadLine(stream1));
 
             await Task.Delay(100);
 
-            byte[] h2b = ReadExact(stream2, 16);
+            byte[] h2b = DrainOneFrame(fs2);
             Assert.Equal(640, BitConverter.ToInt32(h2b, 0));
             Assert.Equal(480, BitConverter.ToInt32(h2b, 4));
 
+            fc2.Dispose();
+
             Send(stream2, "STOP");
             Assert.Equal("OK", ReadLine(stream2));
+        }
+        finally
+        {
+            await server.StopAsync();
+            await serverTask;
+        }
+    }
+
+    [Fact]
+    public async Task RepeatedStartStop_CyclesCleanly()
+    {
+        int port = TestPortBase + 16;
+        var cameras = BuildCameras();
+        var server = new CameraSimulatorServer(cameras);
+
+        for (int cycle = 0; cycle < 3; cycle++)
+        {
+            var serverTask = server.StartAsync(port);
+            await Task.Delay(300);
+
+            try
+            {
+                using var client = new TcpClient();
+                await client.ConnectAsync("127.0.0.1", port);
+                using var stream = client.GetStream();
+
+                Send(stream, "PING");
+                Assert.Equal("PONG", ReadLine(stream));
+
+                Send(stream, "OPEN SIM-CAM-01");
+                Assert.Equal("OK", ReadLine(stream));
+
+                string sid = await StartAndGetSidAsync(stream);
+                var (fc, fs) = await ConnectFramePortAsync(port, sid);
+                using (fc)
+                {
+                    DrainOneFrame(fs);
+                }
+
+                Send(stream, "STOP");
+                Assert.Equal("OK", ReadLine(stream));
+
+                Send(stream, "CLOSE");
+                Assert.Equal("OK", ReadLine(stream));
+            }
+            finally
+            {
+                await server.StopAsync();
+                await serverTask;
+            }
+
+            await Task.Delay(200);
+        }
+    }
+
+    [Fact]
+    public async Task ServerStop_WhileClientIsStreaming_ClosesFramePort()
+    {
+        int port = TestPortBase + 17;
+        var cameras = BuildCameras();
+        var server = new CameraSimulatorServer(cameras);
+        var serverTask = server.StartAsync(port);
+        await Task.Delay(300);
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync("127.0.0.1", port);
+            using var stream = client.GetStream();
+
+            Send(stream, "OPEN SIM-CAM-01");
+            Assert.Equal("OK", ReadLine(stream));
+            string sid = await StartAndGetSidAsync(stream);
+            var (fc, fs) = await ConnectFramePortAsync(port, sid);
+            using (fc)
+            {
+                DrainOneFrame(fs);
+
+                await server.StopAsync();
+                await serverTask;
+
+                var ex = Assert.Throws<IOException>(() => DrainOneFrame(fs));
+                Assert.NotNull(ex);
+            }
+        }
+        finally
+        {
+            await server.StopAsync();
+            await serverTask;
+        }
+    }
+
+    [Fact]
+    public async Task ControlClientDisconnect_FramePortAutomaticallyClosed()
+    {
+        int port = TestPortBase + 18;
+        var cameras = BuildCameras();
+        var server = new CameraSimulatorServer(cameras);
+        var serverTask = server.StartAsync(port);
+        await Task.Delay(300);
+
+        TcpClient frameClient;
+        NetworkStream frameStream;
+
+        try
+        {
+            using (var controlClient = new TcpClient())
+            {
+                await controlClient.ConnectAsync("127.0.0.1", port);
+                using var controlStream = controlClient.GetStream();
+
+                Send(controlStream, "OPEN SIM-CAM-01");
+                Assert.Equal("OK", ReadLine(controlStream));
+                string sid = await StartAndGetSidAsync(controlStream);
+
+                frameClient = new TcpClient();
+                await frameClient.ConnectAsync("127.0.0.1", port + 1);
+                frameStream = frameClient.GetStream();
+                Send(frameStream, $"FRAME_AUTH {sid}");
+                string authResp = ReadLine(frameStream);
+                Assert.Equal("OK", authResp);
+
+                DrainOneFrame(frameStream);
+            }
+
+            await Task.Delay(200);
+
+            var ex = Assert.Throws<IOException>(() => DrainOneFrame(frameStream));
+            Assert.NotNull(ex);
+        }
+        finally
+        {
+            await server.StopAsync();
+            await serverTask;
+        }
+    }
+
+    [Fact]
+    public async Task FrameClientDisconnect_ControlClientCanContinue()
+    {
+        int port = TestPortBase + 19;
+        var cameras = BuildCameras();
+        var server = new CameraSimulatorServer(cameras);
+        var serverTask = server.StartAsync(port);
+        await Task.Delay(300);
+
+        try
+        {
+            using var controlClient = new TcpClient();
+            await controlClient.ConnectAsync("127.0.0.1", port);
+            using var controlStream = controlClient.GetStream();
+
+            Send(controlStream, "OPEN SIM-CAM-01");
+            Assert.Equal("OK", ReadLine(controlStream));
+            string sid = await StartAndGetSidAsync(controlStream);
+
+            using (var fc = new TcpClient())
+            {
+                await fc.ConnectAsync("127.0.0.1", port + 1);
+                var fs = fc.GetStream();
+                Send(fs, $"FRAME_AUTH {sid}");
+                Assert.Equal("OK", ReadLine(fs));
+                DrainOneFrame(fs);
+            }
+
+            await Task.Delay(200);
+
+            Send(controlStream, "PING");
+            Assert.Equal("PONG", ReadLine(controlStream));
+
+            Send(controlStream, "START");
+            string resp2 = ReadLine(controlStream);
+            Assert.StartsWith("OK sid=", resp2);
+            string sid2 = resp2[(resp2.IndexOf("sid=", StringComparison.Ordinal) + 4)..];
+
+            using (var fc2 = new TcpClient())
+            {
+                await fc2.ConnectAsync("127.0.0.1", port + 1);
+                var fs2 = fc2.GetStream();
+                Send(fs2, $"FRAME_AUTH {sid2}");
+                Assert.Equal("OK", ReadLine(fs2));
+                DrainOneFrame(fs2);
+            }
+
+            Send(controlStream, "STOP");
+            Assert.Equal("OK", ReadLine(controlStream));
+        }
+        finally
+        {
+            await server.StopAsync();
+            await serverTask;
+        }
+    }
+
+    [Fact]
+    public async Task InvalidFrameAuth_TokenIsRejected()
+    {
+        int port = TestPortBase + 20;
+        var cameras = BuildCameras();
+        var server = new CameraSimulatorServer(cameras);
+        var serverTask = server.StartAsync(port);
+        await Task.Delay(300);
+
+        try
+        {
+            using var fc = new TcpClient();
+            await fc.ConnectAsync("127.0.0.1", port + 1);
+            using var fs = fc.GetStream();
+            Send(fs, "FRAME_AUTH 00000000-0000-0000-0000-000000000000");
+            string resp = ReadLine(fs);
+            Assert.StartsWith("ERROR", resp);
+
+            using var fc2 = new TcpClient();
+            await fc2.ConnectAsync("127.0.0.1", port + 1);
+            using var fs2 = fc2.GetStream();
+            Send(fs2, "BAD_CMD");
+            string resp2 = ReadLine(fs2);
+            Assert.StartsWith("ERROR", resp2);
         }
         finally
         {
@@ -437,16 +669,19 @@ public class ProtocolIntegrationTests
 
             Send(stream, "OPEN SIM-CAM-01");
             Assert.Equal("OK", ReadLine(stream));
-            Send(stream, "START");
-            Assert.Equal("OK", ReadLine(stream));
-            await Task.Delay(100);
+            string sid = await StartAndGetSidAsync(stream);
+            var (fc, fs) = await ConnectFramePortAsync(port, sid);
+            using (fc)
+            {
+                await Task.Delay(100);
 
-            Send(stream, "GET_STATUS SIM-CAM-01");
-            string single = ReadLine(stream);
-            var one = JsonSerializer.Deserialize<CameraStatusDto>(single, JsonOpts);
-            Assert.NotNull(one);
-            Assert.Equal("SIM-CAM-01", one!.Serial);
-            Assert.True(one.Streaming);
+                Send(stream, "GET_STATUS SIM-CAM-01");
+                string single = ReadLine(stream);
+                var one = JsonSerializer.Deserialize<CameraStatusDto>(single, JsonOpts);
+                Assert.NotNull(one);
+                Assert.Equal("SIM-CAM-01", one!.Serial);
+                Assert.True(one.Streaming);
+            }
 
             Send(stream, "STOP");
             Assert.Equal("OK", ReadLine(stream));
@@ -566,9 +801,12 @@ public class ProtocolIntegrationTests
             {
                 Send(s1, "OPEN SIM-CAM-01");
                 Assert.Equal("OK", ReadLine(s1));
-                Send(s1, "START");
-                Assert.Equal("OK", ReadLine(s1));
-                await Task.Delay(100);
+                string sid = await StartAndGetSidAsync(s1);
+                var (fc, _) = await ConnectFramePortAsync(port, sid);
+                using (fc)
+                {
+                    await Task.Delay(100);
+                }
             }
 
             await Task.Delay(200);
@@ -635,19 +873,19 @@ public class ProtocolIntegrationTests
 
         Send(stream, $"OPEN {serial}");
         Assert.Equal("OK", ReadLine(stream));
-        Send(stream, "START");
-        Assert.Equal("OK", ReadLine(stream));
-        await Task.Delay(100);
+        string sid = await StartAndGetSidAsync(stream);
+        var (frameClient, frameStream) = await ConnectFramePortAsync(port, sid);
+        using (frameClient)
+        {
+            await Task.Delay(100);
 
-        byte[] header = ReadExact(stream, 16);
-        int w = BitConverter.ToInt32(header, 0);
-        int h = BitConverter.ToInt32(header, 4);
-        int bc = BitConverter.ToInt32(header, 12);
+            byte[] header = ReadExact(frameStream, 16);
+            int w = BitConverter.ToInt32(header, 0);
+            int h = BitConverter.ToInt32(header, 4);
+            int bc = BitConverter.ToInt32(header, 12);
 
-        Send(stream, "STOP");
-        Assert.Equal("OK", ReadLine(stream));
-
-        return (w, h, bc);
+            return (w, h, bc);
+        }
     }
 
     [Fact]
@@ -747,6 +985,35 @@ public class ProtocolIntegrationTests
             offset += read;
         }
         return buffer;
+    }
+
+    private static byte[] DrainOneFrame(NetworkStream stream)
+    {
+        byte[] header = ReadExact(stream, 16);
+        int byteCount = BitConverter.ToInt32(header, 12);
+        ReadExact(stream, byteCount);
+        return header;
+    }
+
+    private static async Task<string> StartAndGetSidAsync(NetworkStream controlStream)
+    {
+        Send(controlStream, "START");
+        string resp = ReadLine(controlStream);
+        Assert.StartsWith("OK", resp);
+        int eq = resp.IndexOf("sid=", StringComparison.Ordinal);
+        Assert.True(eq > 0, $"START response missing sid: {resp}");
+        return resp[(eq + 4)..];
+    }
+
+    private static async Task<(TcpClient frameClient, NetworkStream frameStream)> ConnectFramePortAsync(int controlPort, string sid)
+    {
+        var frameClient = new TcpClient();
+        await frameClient.ConnectAsync("127.0.0.1", controlPort + 1);
+        var frameStream = frameClient.GetStream();
+        Send(frameStream, $"FRAME_AUTH {sid}");
+        string authResp = ReadLine(frameStream);
+        Assert.Equal("OK", authResp);
+        return (frameClient, frameStream);
     }
 
     private sealed class RemoteConfigDto

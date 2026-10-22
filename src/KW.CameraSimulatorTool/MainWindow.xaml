@@ -165,20 +165,33 @@
             </StackPanel>
 
             <Border Grid.Column="1"
-                    Background="#E8F1FF"
-                    BorderBrush="#C7DBFF"
-                    BorderThickness="1"
-                    CornerRadius="6"
-                    Padding="12,8"
-                    VerticalAlignment="Center">
+                            Background="#E8F1FF"
+                            BorderBrush="#C7DBFF"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            Padding="12,8"
+                            VerticalAlignment="Center">
                 <StackPanel Orientation="Horizontal">
                     <Ellipse Width="8" Height="8"
-                             Fill="#2563EB"
-                             VerticalAlignment="Center"
-                             Margin="0,0,8,0"/>
+                             Margin="0,0,8,0"
+                             VerticalAlignment="Center">
+                        <Ellipse.Style>
+                            <Style TargetType="Ellipse">
+                                <Setter Property="Fill" Value="#64748B"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsEmulationEnabled}" Value="True">
+                                        <Setter Property="Fill" Value="#10B981"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding IsEmulationEnabled}" Value="False">
+                                        <Setter Property="Fill" Value="#94A3B8"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Ellipse.Style>
+                    </Ellipse>
                     <TextBlock Text="{Binding EmulationStatus}"
                                x:Name="EmulationStatusTextBlock"
-                               Foreground="#1D4ED8"
+                               Foreground="#1E3A8A"
                                FontWeight="SemiBold"
                                VerticalAlignment="Center"/>
                 </StackPanel>
@@ -354,10 +367,12 @@
 
                 <DataGrid Grid.Row="1"
                           ItemsSource="{Binding Cameras}"
-                          IsEnabled="{Binding IsServerStopped}"
+                          IsReadOnly="{Binding IsServerRunning}"
                           SelectionMode="Single"
                           SelectionUnit="FullRow"
-                          AlternationCount="2">
+                          AlternationCount="2"
+                          CanUserAddRows="False"
+                          CanUserDeleteRows="False">
                     <DataGrid.RowStyle>
                         <Style TargetType="DataGridRow">
                             <Setter Property="Background" Value="White"/>
@@ -392,8 +407,8 @@
                                             Width="75"/>
 
                         <DataGridTextColumn Header="Target FPS"
-                                            Binding="{Binding Fps, UpdateSourceTrigger=PropertyChanged}"
-                                            Width="90"/>
+                                            Binding="{Binding Fps, StringFormat=F1, UpdateSourceTrigger=PropertyChanged}"
+                                            Width="95"/>
 
                         <DataGridComboBoxColumn Header="Test pattern"
                                                 SelectedItemBinding="{Binding TestPattern}"

@@ -6,7 +6,7 @@ public class VirtualCameraInfo
     public string DisplayName { get; set; } = string.Empty;
     public int Width { get; set; }
     public int Height { get; set; }
-    public int Fps { get; set; }
+    public double Fps { get; set; }
     public string Vendor { get; set; } = "RemoteSimulated";
     public string Driver { get; set; } = "RemoteSimulated";
 
